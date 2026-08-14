@@ -252,6 +252,7 @@ members = [
     "extensions/glsl",
     "extensions/html",
     "extensions/proto",
+    "extensions/svn",
     "extensions/test-extension",
 
     #
