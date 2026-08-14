@@ -14,6 +14,23 @@ pub fn open_output(
     cx: &mut Context<Workspace>,
 ) {
     let operation = operation.into();
+    open_named_output(
+        format!("Output from git {operation}"),
+        workspace,
+        output,
+        window,
+        cx,
+    );
+}
+
+pub fn open_named_output(
+    title: impl Into<SharedString>,
+    workspace: &mut Workspace,
+    output: &str,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let title = title.into();
 
     let plain_text = terminal::strip_ansi_text(output.as_bytes());
 
@@ -24,7 +41,7 @@ pub fn open_output(
     let editor = cx.new(|cx| {
         let mut editor = Editor::for_buffer(buffer, None, window, cx);
         editor.buffer().update(cx, |buffer, cx| {
-            buffer.set_title(format!("Output from git {operation}"), cx);
+            buffer.set_title(title.to_string(), cx);
         });
         editor.set_read_only(true);
         editor
