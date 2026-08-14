@@ -17,6 +17,7 @@ Extensions can provide:
 - [Icon Themes](./icon-themes.md)
 - [Snippets](./snippets.md)
 - [MCP Servers](./mcp-extensions.md)
+- [Source Control Providers](./source-control-providers.md)
 
 Zed automatically assigns your extension to categories on the Extensions page based on the features it provides. An extension that provides multiple features may appear in more than one category.
 
@@ -74,7 +75,7 @@ my-extension/
 
 ## Rust and WebAssembly
 
-> Please note that most extensions will work properly without any Rust code present. In particular, only language server, context server and debugger extensions require the presence of custom Rust in order to function properly.
+> Please note that most extensions will work properly without any Rust code present. In particular, language server, context server, debugger, and source-control provider extensions require custom Rust code.
 
 Procedural parts of extensions are written in Rust and compiled to WebAssembly. To develop an extension that includes custom code, include a `Cargo.toml` like this:
 
