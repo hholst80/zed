@@ -13,8 +13,9 @@ world extension {
     use context-server.{context-server-configuration};
     use dap.{attach-request, build-task-template, debug-config, debug-adapter-binary, debug-task-definition, debug-request, debug-scenario, launch-request, resolved-task, start-debugging-request-arguments-request};
     use lsp.{completion, symbol};
-    use process.{command};
+    use process.{command, output, scoped-command};
     use slash-command.{slash-command, slash-command-argument-completion, slash-command-output};
+    use source-control.{blame-line, execution-options, history-entry, operation, operation-output, provider-error, repository, revision, status-entry};
 
     /// Initializes the extension.
     export init-extension: func();
@@ -76,6 +77,8 @@ world extension {
         which: func(binary-name: string) -> option<string>;
         /// Returns the current shell environment.
         shell-env: func() -> env-vars;
+        /// Runs a capability-checked command with its working directory constrained to this worktree.
+        run-command: func(command: scoped-command) -> result<output, string>;
     }
 
     /// A Zed project.
@@ -176,4 +179,19 @@ world extension {
     export dap-config-to-scenario: func(config: debug-config) -> result<debug-scenario, string>;
     export dap-locator-create-scenario: func(locator-name: string, build-config-template: build-task-template, resolved-label: string, debug-adapter-name: string) -> option<debug-scenario>;
     export run-dap-locator: func(locator-name: string, config: resolved-task) -> result<debug-request, string>;
+
+    /// Discovers repositories owned by a source-control provider in a worktree.
+    export source-control-discover: func(provider-id: string, worktree: borrow<worktree>) -> result<list<repository>, provider-error>;
+    /// Returns the current working-copy status for a repository.
+    export source-control-status: func(provider-id: string, repository-id: string, worktree: borrow<worktree>) -> result<list<status-entry>, provider-error>;
+    /// Returns base or historical bytes for a working-copy path.
+    export source-control-load-text: func(provider-id: string, repository-id: string, path: string, revision: option<revision>, worktree: borrow<worktree>) -> result<option<list<u8>>, provider-error>;
+    /// Returns a provider-native text and property diff for a path.
+    export source-control-diff: func(provider-id: string, repository-id: string, path: string, worktree: borrow<worktree>) -> result<option<string>, provider-error>;
+    /// Returns repository or path history.
+    export source-control-history: func(provider-id: string, repository-id: string, path: option<string>, limit: u32, worktree: borrow<worktree>) -> result<list<history-entry>, provider-error>;
+    /// Returns per-line attribution metadata.
+    export source-control-blame: func(provider-id: string, repository-id: string, path: string, worktree: borrow<worktree>) -> result<list<blame-line>, provider-error>;
+    /// Executes a capability-gated source-control mutation.
+    export source-control-execute: func(provider-id: string, repository-id: string, operation: operation, options: execution-options, worktree: borrow<worktree>) -> result<operation-output, provider-error>;
 }

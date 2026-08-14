@@ -201,6 +201,7 @@ members = [
     "crates/snippet",
     "crates/snippet_provider",
     "crates/snippets_ui",
+    "crates/source_control",
     "crates/sqlez",
     "crates/sqlez_macros",
     "crates/streaming_diff",
@@ -473,6 +474,7 @@ sidebar = { path = "crates/sidebar" }
 snippet = { path = "crates/snippet" }
 snippet_provider = { path = "crates/snippet_provider" }
 snippets_ui = { path = "crates/snippets_ui" }
+source_control = { path = "crates/source_control" }
 sqlez = { path = "crates/sqlez" }
 sqlez_macros = { path = "crates/sqlez_macros" }
 streaming_diff = { path = "crates/streaming_diff" }

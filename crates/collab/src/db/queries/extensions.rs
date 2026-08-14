@@ -279,6 +279,11 @@ impl Database {
                                 .provides
                                 .contains(&ExtensionProvides::ContextServers),
                         ),
+                        provides_source_control_providers: ActiveValue::Set(
+                            version
+                                .provides
+                                .contains(&ExtensionProvides::SourceControlProviders),
+                        ),
                         provides_agent_servers: ActiveValue::Set(
                             version.provides.contains(&ExtensionProvides::AgentServers),
                         ),
