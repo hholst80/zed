@@ -1,0 +1,255 @@
+syntax = "proto3";
+package zed.messages;
+
+message SourceControlCapabilities {
+  bool discovery = 1;
+  bool status = 2;
+  bool base_text = 3;
+  bool diff = 4;
+  bool commit = 5;
+  bool add = 6;
+  bool delete = 7;
+  bool revert = 8;
+  bool resolve = 9;
+  bool ignore = 10;
+  bool update = 11;
+  bool checkout = 12;
+  bool switch = 13;
+  bool history = 14;
+  bool blame = 15;
+}
+
+enum SourceControlNodeKind {
+  SOURCE_CONTROL_NODE_KIND_UNKNOWN = 0;
+  SOURCE_CONTROL_NODE_KIND_FILE = 1;
+  SOURCE_CONTROL_NODE_KIND_DIRECTORY = 2;
+  SOURCE_CONTROL_NODE_KIND_SYMBOLIC_LINK = 3;
+}
+
+enum SourceControlContentStatus {
+  SOURCE_CONTROL_CONTENT_STATUS_NORMAL = 0;
+  SOURCE_CONTROL_CONTENT_STATUS_MODIFIED = 1;
+  SOURCE_CONTROL_CONTENT_STATUS_ADDED = 2;
+  SOURCE_CONTROL_CONTENT_STATUS_DELETED = 3;
+  SOURCE_CONTROL_CONTENT_STATUS_MISSING = 4;
+  SOURCE_CONTROL_CONTENT_STATUS_REPLACED = 5;
+  SOURCE_CONTROL_CONTENT_STATUS_CONFLICTED = 6;
+  SOURCE_CONTROL_CONTENT_STATUS_OBSTRUCTED = 7;
+  SOURCE_CONTROL_CONTENT_STATUS_UNVERSIONED = 8;
+  SOURCE_CONTROL_CONTENT_STATUS_IGNORED = 9;
+  SOURCE_CONTROL_CONTENT_STATUS_EXTERNAL = 10;
+}
+
+enum SourceControlSelectionEligibility {
+  SOURCE_CONTROL_SELECTION_ELIGIBILITY_UNAVAILABLE = 0;
+  SOURCE_CONTROL_SELECTION_ELIGIBILITY_INCLUDED_BY_DEFAULT = 1;
+  SOURCE_CONTROL_SELECTION_ELIGIBILITY_AVAILABLE = 2;
+  SOURCE_CONTROL_SELECTION_ELIGIBILITY_REQUIRES_ADD = 3;
+  SOURCE_CONTROL_SELECTION_ELIGIBILITY_REQUIRES_DELETE = 4;
+}
+
+message SourceControlStatusEntry {
+  string path = 1;
+  SourceControlNodeKind node_kind = 2;
+  SourceControlContentStatus content_status = 3;
+  SourceControlContentStatus property_status = 4;
+  SourceControlSelectionEligibility selection = 5;
+  bool copied = 6;
+  bool switched = 7;
+  bool locked = 8;
+  bool tree_conflicted = 9;
+  bool out_of_date = 10;
+  optional uint32 added_lines = 11;
+  optional uint32 deleted_lines = 12;
+}
+
+message SourceControlRepositorySnapshot {
+  string provider_id = 1;
+  string repository_id = 2;
+  repeated uint64 worktree_ids = 3;
+  string working_copy_path = 4;
+  string display_name = 5;
+  optional string summary = 6;
+  SourceControlCapabilities capabilities = 7;
+  repeated SourceControlStatusEntry statuses = 8;
+  string provider_display_name = 9;
+}
+
+message SourceControlRevision {
+  string canonical = 1;
+  string display = 2;
+}
+
+message SourceControlHistoryEntry {
+  SourceControlRevision revision = 1;
+  optional string author = 2;
+  optional string timestamp = 3;
+  string message = 4;
+  repeated string changed_paths = 5;
+}
+
+message SourceControlBlameLine {
+  uint32 line_number = 1;
+  optional SourceControlRevision revision = 2;
+  optional string author = 3;
+  optional string timestamp = 4;
+}
+
+enum SourceControlErrorKind {
+  SOURCE_CONTROL_ERROR_KIND_PROVIDER_UNAVAILABLE = 0;
+  SOURCE_CONTROL_ERROR_KIND_REPOSITORY_NOT_FOUND = 1;
+  SOURCE_CONTROL_ERROR_KIND_UNSUPPORTED_OPERATION = 2;
+  SOURCE_CONTROL_ERROR_KIND_AUTHENTICATION_REQUIRED = 3;
+  SOURCE_CONTROL_ERROR_KIND_TRUST_REQUIRED = 4;
+  SOURCE_CONTROL_ERROR_KIND_CANCELLED = 5;
+  SOURCE_CONTROL_ERROR_KIND_STALE_STATE = 6;
+  SOURCE_CONTROL_ERROR_KIND_COMMAND_FAILED = 7;
+  SOURCE_CONTROL_ERROR_KIND_MALFORMED_RESPONSE = 8;
+  SOURCE_CONTROL_ERROR_KIND_TRANSPORT_FAILURE = 9;
+  SOURCE_CONTROL_ERROR_KIND_INVALID_REQUEST = 10;
+}
+
+message SourceControlError {
+  SourceControlErrorKind kind = 1;
+  string message = 2;
+  optional string capability = 3;
+  optional string realm = 4;
+  optional string username = 5;
+  optional string fingerprint = 6;
+  repeated string trust_failures = 7;
+  optional int32 exit_code = 8;
+}
+
+message SourceControlSnapshotRequest {
+  uint64 project_id = 1;
+}
+
+message SourceControlSnapshotResponse {
+  repeated SourceControlRepositorySnapshot repositories = 1;
+  repeated SourceControlProviderFailure provider_failures = 2;
+}
+
+message SourceControlProviderFailure {
+  string provider_id = 1;
+  SourceControlError error = 2;
+}
+
+message SourceControlLoadTextRequest {
+  uint64 project_id = 1;
+  string provider_id = 2;
+  string repository_id = 3;
+  string path = 4;
+  optional SourceControlRevision revision = 5;
+}
+
+message SourceControlLoadTextResponse {
+  optional bytes contents = 1;
+  optional SourceControlError error = 2;
+}
+
+message SourceControlDiffRequest {
+  uint64 project_id = 1;
+  string provider_id = 2;
+  string repository_id = 3;
+  string path = 4;
+}
+
+message SourceControlDiffResponse {
+  optional string diff = 1;
+  optional SourceControlError error = 2;
+}
+
+message SourceControlHistoryRequest {
+  uint64 project_id = 1;
+  string provider_id = 2;
+  string repository_id = 3;
+  optional string path = 4;
+  uint32 limit = 5;
+}
+
+message SourceControlHistoryResponse {
+  repeated SourceControlHistoryEntry entries = 1;
+  optional SourceControlError error = 2;
+}
+
+message SourceControlBlameRequest {
+  uint64 project_id = 1;
+  string provider_id = 2;
+  string repository_id = 3;
+  string path = 4;
+}
+
+message SourceControlBlameResponse {
+  repeated SourceControlBlameLine lines = 1;
+  optional SourceControlError error = 2;
+}
+
+message SourceControlPathsOperation {
+  repeated string paths = 1;
+}
+
+message SourceControlCommitOperation {
+  repeated string paths = 1;
+  string message = 2;
+}
+
+message SourceControlIgnoreOperation {
+  string directory = 1;
+  string pattern = 2;
+}
+
+message SourceControlCheckoutOperation {
+  string url = 1;
+  string destination = 2;
+  optional SourceControlRevision revision = 3;
+}
+
+message SourceControlSwitchOperation {
+  string url = 1;
+  optional SourceControlRevision revision = 2;
+}
+
+message SourceControlNoArguments {}
+
+message SourceControlOperation {
+  oneof operation {
+    SourceControlCommitOperation commit = 1;
+    SourceControlPathsOperation add = 2;
+    SourceControlPathsOperation delete = 3;
+    SourceControlPathsOperation revert = 4;
+    SourceControlPathsOperation resolve = 5;
+    SourceControlIgnoreOperation ignore = 6;
+    SourceControlNoArguments update = 7;
+    SourceControlCheckoutOperation checkout = 8;
+    SourceControlSwitchOperation switch = 9;
+  }
+}
+
+message SourceControlAuthentication {
+  string username = 1;
+  bytes password = 2;
+}
+
+message SourceControlTrustDecision {
+  repeated string failures = 1;
+}
+
+message SourceControlExecutionOptions {
+  optional SourceControlAuthentication authentication = 1;
+  optional SourceControlTrustDecision trust = 2;
+}
+
+message SourceControlExecuteRequest {
+  uint64 project_id = 1;
+  string provider_id = 2;
+  string repository_id = 3;
+  SourceControlOperation operation = 4;
+  optional SourceControlExecutionOptions options = 5;
+}
+
+message SourceControlExecuteResponse {
+  optional string message = 1;
+  optional string opened_path = 2;
+  bool refresh_required = 3;
+  optional SourceControlError error = 4;
+}

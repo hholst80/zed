@@ -177,6 +177,7 @@ CREATE TABLE public.extension_versions (
     provides_grammars boolean DEFAULT false NOT NULL,
     provides_language_servers boolean DEFAULT false NOT NULL,
     provides_context_servers boolean DEFAULT false NOT NULL,
+    provides_source_control_providers boolean DEFAULT false NOT NULL,
     provides_slash_commands boolean DEFAULT false NOT NULL,
     provides_indexed_docs_providers boolean DEFAULT false NOT NULL,
     provides_snippets boolean DEFAULT false NOT NULL,

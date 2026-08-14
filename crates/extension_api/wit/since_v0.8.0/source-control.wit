@@ -1,0 +1,178 @@
+interface source-control {
+    record capabilities {
+        discovery: bool,
+        status: bool,
+        base-text: bool,
+        diff: bool,
+        commit: bool,
+        add: bool,
+        delete: bool,
+        revert: bool,
+        resolve: bool,
+        ignore: bool,
+        update: bool,
+        checkout: bool,
+        switch: bool,
+        history: bool,
+        blame: bool,
+    }
+
+    record repository {
+        id: string,
+        working-copy-path: string,
+        display-name: string,
+        summary: option<string>,
+        capabilities: capabilities,
+    }
+
+    enum node-kind {
+        file,
+        directory,
+        symbolic-link,
+        unknown,
+    }
+
+    enum content-status {
+        normal,
+        modified,
+        added,
+        deleted,
+        missing,
+        replaced,
+        conflicted,
+        obstructed,
+        unversioned,
+        ignored,
+        external,
+    }
+
+    enum selection-eligibility {
+        included-by-default,
+        available,
+        requires-add,
+        requires-delete,
+        unavailable,
+    }
+
+    record status-entry {
+        path: string,
+        node-kind: node-kind,
+        content-status: content-status,
+        property-status: content-status,
+        selection: selection-eligibility,
+        copied: bool,
+        switched: bool,
+        locked: bool,
+        tree-conflicted: bool,
+        out-of-date: bool,
+        added-lines: option<u32>,
+        deleted-lines: option<u32>,
+    }
+
+    record revision {
+        canonical: string,
+        display: string,
+    }
+
+    record history-entry {
+        revision: revision,
+        author: option<string>,
+        timestamp: option<string>,
+        message: string,
+        changed-paths: list<string>,
+    }
+
+    record blame-line {
+        line-number: u32,
+        revision: option<revision>,
+        author: option<string>,
+        timestamp: option<string>,
+    }
+
+    record commit-operation {
+        paths: list<string>,
+        message: string,
+    }
+
+    record paths-operation {
+        paths: list<string>,
+    }
+
+    record ignore-operation {
+        directory: string,
+        pattern: string,
+    }
+
+    record checkout-operation {
+        url: string,
+        destination: string,
+        revision: option<revision>,
+    }
+
+    record switch-operation {
+        url: string,
+        revision: option<revision>,
+    }
+
+    variant operation {
+        commit(commit-operation),
+        add(paths-operation),
+        delete(paths-operation),
+        revert(paths-operation),
+        resolve(paths-operation),
+        ignore(ignore-operation),
+        update,
+        checkout(checkout-operation),
+        switch(switch-operation),
+    }
+
+    record operation-output {
+        message: option<string>,
+        opened-path: option<string>,
+        refresh-required: bool,
+    }
+
+    record authentication-request {
+        realm: string,
+        username: option<string>,
+    }
+
+    record authentication {
+        username: string,
+        password: string,
+    }
+
+    record trust-decision {
+        failures: list<string>,
+    }
+
+    record execution-options {
+        authentication: option<authentication>,
+        trust: option<trust-decision>,
+    }
+
+    record trust-request {
+        realm: string,
+        fingerprint: string,
+        failures: list<string>,
+    }
+
+    variant error-kind {
+        provider-unavailable,
+        repository-not-found,
+        unsupported-operation(string),
+        authentication-required(authentication-request),
+        trust-required(trust-request),
+        cancelled,
+        stale-state,
+        command-failed(option<s32>),
+        malformed-response,
+        transport-failure,
+        invalid-request,
+    }
+
+    record provider-error {
+        kind: error-kind,
+        message: string,
+    }
+}
