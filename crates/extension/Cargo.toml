@@ -31,6 +31,7 @@ proto.workspace = true
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+source_control.workspace = true
 task.workspace = true
 toml.workspace = true
 tracing.workspace = true

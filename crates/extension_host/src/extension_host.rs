@@ -17,7 +17,8 @@ use extension::extension_builder::{CompileExtensionOptions, ExtensionBuilder};
 use extension::{
     ExtensionContextServerProxy, ExtensionDebugAdapterProviderProxy, ExtensionEvents,
     ExtensionGrammarProxy, ExtensionHostProxy, ExtensionLanguageProxy,
-    ExtensionLanguageServerProxy, ExtensionSnippetProxy, ExtensionThemeProxy,
+    ExtensionLanguageServerProxy, ExtensionSnippetProxy, ExtensionSourceControlProviderProxy,
+    ExtensionThemeProxy,
 };
 use fs::{Fs, RemoveOptions, RenameOptions};
 use futures::future::join_all;
@@ -1316,6 +1317,19 @@ impl ExtensionStore {
             for server_id in extension.manifest.context_servers.keys() {
                 self.proxy.unregister_context_server(server_id.clone(), cx);
             }
+            for provider_id in extension.manifest.source_control_providers.keys() {
+                match source_control::SourceControlProviderId::new(provider_id.clone()) {
+                    Ok(provider_id) => self.proxy.unregister_source_control_provider(
+                        &extension.manifest.id,
+                        &provider_id,
+                        cx,
+                    ),
+                    Err(error) => log::error!(
+                        "Invalid source control provider ID in extension {}: {error}",
+                        extension.manifest.id
+                    ),
+                }
+            }
             for adapter in extension.manifest.debug_adapters.keys() {
                 self.proxy.unregister_debug_adapter(adapter.clone());
             }
@@ -1546,6 +1560,21 @@ impl ExtensionStore {
                     for id in manifest.context_servers.keys() {
                         this.proxy
                             .register_context_server(extension.clone(), id.clone(), cx);
+                    }
+
+                    for (provider_id, provider) in &manifest.source_control_providers {
+                        match source_control::SourceControlProviderId::new(provider_id.clone()) {
+                            Ok(provider_id) => this.proxy.register_source_control_provider(
+                                extension.clone(),
+                                provider_id,
+                                Arc::from(provider.display_name.as_str()),
+                                cx,
+                            ),
+                            Err(error) => log::error!(
+                                "Invalid source control provider ID in extension {}: {error}",
+                                manifest.id
+                            ),
+                        }
                     }
 
                     for (debug_adapter, meta) in &manifest.debug_adapters {

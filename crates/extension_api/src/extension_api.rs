@@ -37,6 +37,20 @@ pub use wit::{
     zed::extension::slash_command::{
         SlashCommand, SlashCommandArgumentCompletion, SlashCommandOutput, SlashCommandOutputSection,
     },
+    zed::extension::source_control::{
+        Authentication as SourceControlAuthentication,
+        AuthenticationRequest as SourceControlAuthenticationRequest,
+        BlameLine as SourceControlBlameLine, Capabilities as SourceControlCapabilities,
+        ContentStatus as SourceControlContentStatus, ErrorKind as SourceControlErrorKind,
+        ExecutionOptions as SourceControlExecutionOptions,
+        HistoryEntry as SourceControlHistoryEntry, NodeKind as SourceControlNodeKind,
+        Operation as SourceControlOperation, OperationOutput as SourceControlOperationOutput,
+        ProviderError as SourceControlProviderError, Repository as SourceControlRepository,
+        Revision as SourceControlRevision,
+        SelectionEligibility as SourceControlSelectionEligibility,
+        StatusEntry as SourceControlStatusEntry, TrustDecision as SourceControlTrustDecision,
+        TrustRequest as SourceControlTrustRequest,
+    },
 };
 
 // Undocumented WIT re-exports.
@@ -280,6 +294,90 @@ pub trait Extension: Send + Sync {
         _build_task: TaskTemplate,
     ) -> Result<DebugRequest, String> {
         Err("`run_dap_locator` not implemented".to_string())
+    }
+
+    /// Discovers repositories owned by a source-control provider in a worktree.
+    fn source_control_discover(
+        &mut self,
+        _provider_id: &str,
+        _worktree: &Worktree,
+    ) -> Result<Vec<SourceControlRepository>, SourceControlProviderError> {
+        Err(source_control_not_implemented("discovery"))
+    }
+
+    /// Returns the current working-copy status for a source-control repository.
+    fn source_control_status(
+        &mut self,
+        _provider_id: &str,
+        _repository_id: &str,
+        _worktree: &Worktree,
+    ) -> Result<Vec<SourceControlStatusEntry>, SourceControlProviderError> {
+        Err(source_control_not_implemented("status"))
+    }
+
+    /// Returns base or historical bytes for a working-copy path.
+    fn source_control_load_text(
+        &mut self,
+        _provider_id: &str,
+        _repository_id: &str,
+        _path: &str,
+        _revision: Option<SourceControlRevision>,
+        _worktree: &Worktree,
+    ) -> Result<Option<Vec<u8>>, SourceControlProviderError> {
+        Err(source_control_not_implemented("base text"))
+    }
+
+    /// Returns a provider-native text and property diff for a working-copy path.
+    fn source_control_diff(
+        &mut self,
+        _provider_id: &str,
+        _repository_id: &str,
+        _path: &str,
+        _worktree: &Worktree,
+    ) -> Result<Option<String>, SourceControlProviderError> {
+        Err(source_control_not_implemented("diff"))
+    }
+
+    /// Returns repository or path history.
+    fn source_control_history(
+        &mut self,
+        _provider_id: &str,
+        _repository_id: &str,
+        _path: Option<&str>,
+        _limit: u32,
+        _worktree: &Worktree,
+    ) -> Result<Vec<SourceControlHistoryEntry>, SourceControlProviderError> {
+        Err(source_control_not_implemented("history"))
+    }
+
+    /// Returns per-line attribution metadata.
+    fn source_control_blame(
+        &mut self,
+        _provider_id: &str,
+        _repository_id: &str,
+        _path: &str,
+        _worktree: &Worktree,
+    ) -> Result<Vec<SourceControlBlameLine>, SourceControlProviderError> {
+        Err(source_control_not_implemented("blame"))
+    }
+
+    /// Executes a source-control mutation.
+    fn source_control_execute(
+        &mut self,
+        _provider_id: &str,
+        _repository_id: &str,
+        _operation: SourceControlOperation,
+        _options: SourceControlExecutionOptions,
+        _worktree: &Worktree,
+    ) -> Result<SourceControlOperationOutput, SourceControlProviderError> {
+        Err(source_control_not_implemented("mutation"))
+    }
+}
+
+fn source_control_not_implemented(capability: &str) -> SourceControlProviderError {
+    SourceControlProviderError {
+        kind: SourceControlErrorKind::UnsupportedOperation(capability.to_owned()),
+        message: format!("source-control {capability} is not implemented by this extension"),
     }
 }
 
@@ -558,6 +656,87 @@ impl wit::Guest for Component {
         build_task: TaskTemplate,
     ) -> Result<DebugRequest, String> {
         extension().run_dap_locator(locator_name, build_task)
+    }
+
+    fn source_control_discover(
+        provider_id: String,
+        worktree: &Worktree,
+    ) -> Result<Vec<SourceControlRepository>, SourceControlProviderError> {
+        extension().source_control_discover(&provider_id, worktree)
+    }
+
+    fn source_control_status(
+        provider_id: String,
+        repository_id: String,
+        worktree: &Worktree,
+    ) -> Result<Vec<SourceControlStatusEntry>, SourceControlProviderError> {
+        extension().source_control_status(&provider_id, &repository_id, worktree)
+    }
+
+    fn source_control_load_text(
+        provider_id: String,
+        repository_id: String,
+        path: String,
+        revision: Option<SourceControlRevision>,
+        worktree: &Worktree,
+    ) -> Result<Option<Vec<u8>>, SourceControlProviderError> {
+        extension().source_control_load_text(
+            &provider_id,
+            &repository_id,
+            &path,
+            revision,
+            worktree,
+        )
+    }
+
+    fn source_control_diff(
+        provider_id: String,
+        repository_id: String,
+        path: String,
+        worktree: &Worktree,
+    ) -> Result<Option<String>, SourceControlProviderError> {
+        extension().source_control_diff(&provider_id, &repository_id, &path, worktree)
+    }
+
+    fn source_control_history(
+        provider_id: String,
+        repository_id: String,
+        path: Option<String>,
+        limit: u32,
+        worktree: &Worktree,
+    ) -> Result<Vec<SourceControlHistoryEntry>, SourceControlProviderError> {
+        extension().source_control_history(
+            &provider_id,
+            &repository_id,
+            path.as_deref(),
+            limit,
+            worktree,
+        )
+    }
+
+    fn source_control_blame(
+        provider_id: String,
+        repository_id: String,
+        path: String,
+        worktree: &Worktree,
+    ) -> Result<Vec<SourceControlBlameLine>, SourceControlProviderError> {
+        extension().source_control_blame(&provider_id, &repository_id, &path, worktree)
+    }
+
+    fn source_control_execute(
+        provider_id: String,
+        repository_id: String,
+        operation: SourceControlOperation,
+        options: SourceControlExecutionOptions,
+        worktree: &Worktree,
+    ) -> Result<SourceControlOperationOutput, SourceControlProviderError> {
+        extension().source_control_execute(
+            &provider_id,
+            &repository_id,
+            operation,
+            options,
+            worktree,
+        )
     }
 }
 

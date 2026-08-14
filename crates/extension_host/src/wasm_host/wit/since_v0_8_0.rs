@@ -3,25 +3,29 @@ use crate::wasm_host::wit::{CompletionKind, CompletionLabelDetails, InsertTextFo
 use crate::wasm_host::{WasmState, wit::ToWasmtimeResult};
 use ::http_client::{AsyncBody, HttpRequestExt};
 use ::settings::{Settings, WorktreeId};
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use async_compression::futures::bufread::GzipDecoder;
 use async_tar::Archive;
 use async_trait::async_trait;
 use extension::{
     ExtensionLanguageServerProxy, KeyValueStoreDelegate, ProjectDelegate, WorktreeDelegate,
 };
-use futures::{AsyncReadExt, lock::Mutex};
+use futures::{AsyncReadExt, AsyncWriteExt, lock::Mutex};
 use futures::{FutureExt as _, io::BufReader};
 use gpui::{BackgroundExecutor, SharedString};
 use language::{BinaryStatus, LanguageName, language_settings::AllLanguageSettings};
 use project::project_settings::ProjectSettings;
 use semver::Version;
 use std::{
+    collections::BTreeMap,
     env,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
     str::FromStr,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 use task::{SpawnInTerminal, ZedDebugConfig};
 use url::Url;
@@ -86,6 +90,360 @@ impl From<Command> for extension::Command {
             env: value.env,
         }
     }
+}
+
+pub fn source_control_repository_from_wit(
+    value: source_control::Repository,
+    provider_id: ::source_control::SourceControlProviderId,
+    worktree_id: u64,
+) -> std::result::Result<
+    ::source_control::SourceControlRepository,
+    ::source_control::SourceControlError,
+> {
+    let repository_id = ::source_control::SourceControlRepositoryId::new(value.id)?;
+    let working_copy_path = PathBuf::from(value.working_copy_path);
+    if !working_copy_path.is_absolute() {
+        return Err(::source_control::SourceControlError::new(
+            ::source_control::SourceControlErrorKind::MalformedResponse,
+            "a source-control provider returned a non-absolute working-copy path",
+        ));
+    }
+    Ok(::source_control::SourceControlRepository {
+        key: ::source_control::SourceControlRepositoryKey::new(provider_id, repository_id),
+        worktree_ids: vec![worktree_id],
+        working_copy_path: working_copy_path.into(),
+        display_name: value.display_name.into(),
+        summary: value.summary.map(Into::into),
+        capabilities: source_control_capabilities_from_wit(value.capabilities),
+    })
+}
+
+pub fn source_control_status_from_wit(
+    value: source_control::StatusEntry,
+) -> std::result::Result<
+    ::source_control::SourceControlStatusEntry,
+    ::source_control::SourceControlError,
+> {
+    Ok(::source_control::SourceControlStatusEntry {
+        path: ::source_control::SourceControlPath::new(value.path)?,
+        node_kind: match value.node_kind {
+            source_control::NodeKind::File => ::source_control::SourceControlNodeKind::File,
+            source_control::NodeKind::Directory => {
+                ::source_control::SourceControlNodeKind::Directory
+            }
+            source_control::NodeKind::SymbolicLink => {
+                ::source_control::SourceControlNodeKind::SymbolicLink
+            }
+            source_control::NodeKind::Unknown => ::source_control::SourceControlNodeKind::Unknown,
+        },
+        content_status: source_control_content_status_from_wit(value.content_status),
+        property_status: source_control_content_status_from_wit(value.property_status),
+        selection: match value.selection {
+            source_control::SelectionEligibility::IncludedByDefault => {
+                ::source_control::SourceControlSelectionEligibility::IncludedByDefault
+            }
+            source_control::SelectionEligibility::Available => {
+                ::source_control::SourceControlSelectionEligibility::Available
+            }
+            source_control::SelectionEligibility::RequiresAdd => {
+                ::source_control::SourceControlSelectionEligibility::RequiresAdd
+            }
+            source_control::SelectionEligibility::RequiresDelete => {
+                ::source_control::SourceControlSelectionEligibility::RequiresDelete
+            }
+            source_control::SelectionEligibility::Unavailable => {
+                ::source_control::SourceControlSelectionEligibility::Unavailable
+            }
+        },
+        copied: value.copied,
+        switched: value.switched,
+        locked: value.locked,
+        tree_conflicted: value.tree_conflicted,
+        out_of_date: value.out_of_date,
+        added_lines: value.added_lines,
+        deleted_lines: value.deleted_lines,
+    })
+}
+
+pub fn source_control_history_from_wit(
+    value: source_control::HistoryEntry,
+) -> std::result::Result<
+    ::source_control::SourceControlHistoryEntry,
+    ::source_control::SourceControlError,
+> {
+    Ok(::source_control::SourceControlHistoryEntry {
+        revision: source_control_revision_from_wit(value.revision),
+        author: value.author.map(Into::into),
+        timestamp: value.timestamp.map(Into::into),
+        message: value.message.into(),
+        changed_paths: value
+            .changed_paths
+            .into_iter()
+            .map(::source_control::SourceControlPath::new)
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+    })
+}
+
+pub fn source_control_blame_from_wit(
+    value: source_control::BlameLine,
+) -> ::source_control::SourceControlBlameLine {
+    ::source_control::SourceControlBlameLine {
+        line_number: value.line_number,
+        revision: value.revision.map(source_control_revision_from_wit),
+        author: value.author.map(Into::into),
+        timestamp: value.timestamp.map(Into::into),
+    }
+}
+
+pub fn source_control_operation_to_wit(
+    value: ::source_control::SourceControlOperation,
+) -> std::result::Result<source_control::Operation, ::source_control::SourceControlError> {
+    Ok(match value {
+        ::source_control::SourceControlOperation::Commit { paths, message } => {
+            source_control::Operation::Commit(source_control::CommitOperation {
+                paths: source_control_paths_to_wit(paths),
+                message,
+            })
+        }
+        ::source_control::SourceControlOperation::Add { paths } => {
+            source_control::Operation::Add(source_control::PathsOperation {
+                paths: source_control_paths_to_wit(paths),
+            })
+        }
+        ::source_control::SourceControlOperation::Delete { paths } => {
+            source_control::Operation::Delete(source_control::PathsOperation {
+                paths: source_control_paths_to_wit(paths),
+            })
+        }
+        ::source_control::SourceControlOperation::Revert { paths } => {
+            source_control::Operation::Revert(source_control::PathsOperation {
+                paths: source_control_paths_to_wit(paths),
+            })
+        }
+        ::source_control::SourceControlOperation::Resolve { paths } => {
+            source_control::Operation::Resolve(source_control::PathsOperation {
+                paths: source_control_paths_to_wit(paths),
+            })
+        }
+        ::source_control::SourceControlOperation::Ignore { directory, pattern } => {
+            source_control::Operation::Ignore(source_control::IgnoreOperation {
+                directory: directory.as_str().to_owned(),
+                pattern,
+            })
+        }
+        ::source_control::SourceControlOperation::Update => source_control::Operation::Update,
+        ::source_control::SourceControlOperation::Checkout {
+            url,
+            destination,
+            revision,
+        } => source_control::Operation::Checkout(source_control::CheckoutOperation {
+            url,
+            destination: destination
+                .to_str()
+                .ok_or_else(|| {
+                    ::source_control::SourceControlError::invalid_request(
+                        "checkout destination must be UTF-8",
+                    )
+                })?
+                .to_owned(),
+            revision: revision.map(source_control_revision_to_wit),
+        }),
+        ::source_control::SourceControlOperation::Switch { url, revision } => {
+            source_control::Operation::Switch(source_control::SwitchOperation {
+                url,
+                revision: revision.map(source_control_revision_to_wit),
+            })
+        }
+    })
+}
+
+pub fn source_control_execution_options_to_wit(
+    value: ::source_control::SourceControlExecutionOptions,
+) -> source_control::ExecutionOptions {
+    source_control::ExecutionOptions {
+        authentication: value
+            .authentication
+            .map(|authentication| source_control::Authentication {
+                username: authentication.username.to_string(),
+                password: authentication.password.as_str().to_owned(),
+            }),
+        trust: value.trust.map(|trust| source_control::TrustDecision {
+            failures: trust
+                .failures
+                .into_iter()
+                .map(|failure| failure.to_string())
+                .collect(),
+        }),
+    }
+}
+
+pub fn source_control_operation_output_from_wit(
+    value: source_control::OperationOutput,
+) -> ::source_control::SourceControlOperationOutput {
+    ::source_control::SourceControlOperationOutput {
+        message: value.message.map(Into::into),
+        opened_path: value.opened_path.map(PathBuf::from),
+        refresh_required: value.refresh_required,
+    }
+}
+
+pub fn source_control_error_from_wit(
+    value: source_control::ProviderError,
+) -> ::source_control::SourceControlError {
+    let kind = match value.kind {
+        source_control::ErrorKind::ProviderUnavailable => {
+            ::source_control::SourceControlErrorKind::ProviderUnavailable
+        }
+        source_control::ErrorKind::RepositoryNotFound => {
+            ::source_control::SourceControlErrorKind::RepositoryNotFound
+        }
+        source_control::ErrorKind::UnsupportedOperation(capability) => {
+            let Some(capability) = source_control_capability_from_name(&capability) else {
+                return ::source_control::SourceControlError::new(
+                    ::source_control::SourceControlErrorKind::MalformedResponse,
+                    format!(
+                        "source-control extension returned an unknown capability {capability:?}"
+                    ),
+                );
+            };
+            ::source_control::SourceControlErrorKind::UnsupportedOperation { capability }
+        }
+        source_control::ErrorKind::AuthenticationRequired(request) => {
+            ::source_control::SourceControlErrorKind::AuthenticationRequired {
+                realm: request.realm.into(),
+                username: request.username.map(Into::into),
+            }
+        }
+        source_control::ErrorKind::TrustRequired(request) => {
+            ::source_control::SourceControlErrorKind::TrustRequired {
+                realm: request.realm.into(),
+                fingerprint: request.fingerprint.into(),
+                failures: request.failures.into_iter().map(Into::into).collect(),
+            }
+        }
+        source_control::ErrorKind::Cancelled => ::source_control::SourceControlErrorKind::Cancelled,
+        source_control::ErrorKind::StaleState => {
+            ::source_control::SourceControlErrorKind::StaleState
+        }
+        source_control::ErrorKind::CommandFailed(exit_code) => {
+            ::source_control::SourceControlErrorKind::CommandFailed { exit_code }
+        }
+        source_control::ErrorKind::MalformedResponse => {
+            ::source_control::SourceControlErrorKind::MalformedResponse
+        }
+        source_control::ErrorKind::TransportFailure => {
+            ::source_control::SourceControlErrorKind::TransportFailure
+        }
+        source_control::ErrorKind::InvalidRequest => {
+            ::source_control::SourceControlErrorKind::InvalidRequest
+        }
+    };
+    ::source_control::SourceControlError::new(kind, value.message)
+}
+
+pub fn source_control_revision_to_wit(
+    value: ::source_control::SourceControlRevision,
+) -> source_control::Revision {
+    source_control::Revision {
+        canonical: value.canonical.to_string(),
+        display: value.display.to_string(),
+    }
+}
+
+pub fn source_control_revision_from_wit(
+    value: source_control::Revision,
+) -> ::source_control::SourceControlRevision {
+    ::source_control::SourceControlRevision::new(value.canonical, value.display)
+}
+
+fn source_control_paths_to_wit(paths: Vec<::source_control::SourceControlPath>) -> Vec<String> {
+    paths
+        .into_iter()
+        .map(|path| path.as_str().to_owned())
+        .collect()
+}
+
+fn source_control_capabilities_from_wit(
+    value: source_control::Capabilities,
+) -> ::source_control::SourceControlCapabilities {
+    ::source_control::SourceControlCapabilities {
+        discovery: value.discovery,
+        status: value.status,
+        base_text: value.base_text,
+        diff: value.diff,
+        commit: value.commit,
+        add: value.add,
+        delete: value.delete,
+        revert: value.revert,
+        resolve: value.resolve,
+        ignore: value.ignore,
+        update: value.update,
+        checkout: value.checkout,
+        switch: value.switch,
+        history: value.history,
+        blame: value.blame,
+    }
+}
+
+fn source_control_content_status_from_wit(
+    value: source_control::ContentStatus,
+) -> ::source_control::SourceControlContentStatus {
+    match value {
+        source_control::ContentStatus::Normal => {
+            ::source_control::SourceControlContentStatus::Normal
+        }
+        source_control::ContentStatus::Modified => {
+            ::source_control::SourceControlContentStatus::Modified
+        }
+        source_control::ContentStatus::Added => ::source_control::SourceControlContentStatus::Added,
+        source_control::ContentStatus::Deleted => {
+            ::source_control::SourceControlContentStatus::Deleted
+        }
+        source_control::ContentStatus::Missing => {
+            ::source_control::SourceControlContentStatus::Missing
+        }
+        source_control::ContentStatus::Replaced => {
+            ::source_control::SourceControlContentStatus::Replaced
+        }
+        source_control::ContentStatus::Conflicted => {
+            ::source_control::SourceControlContentStatus::Conflicted
+        }
+        source_control::ContentStatus::Obstructed => {
+            ::source_control::SourceControlContentStatus::Obstructed
+        }
+        source_control::ContentStatus::Unversioned => {
+            ::source_control::SourceControlContentStatus::Unversioned
+        }
+        source_control::ContentStatus::Ignored => {
+            ::source_control::SourceControlContentStatus::Ignored
+        }
+        source_control::ContentStatus::External => {
+            ::source_control::SourceControlContentStatus::External
+        }
+    }
+}
+
+fn source_control_capability_from_name(
+    value: &str,
+) -> Option<::source_control::SourceControlCapability> {
+    Some(match value {
+        "discovery" => ::source_control::SourceControlCapability::Discovery,
+        "status" => ::source_control::SourceControlCapability::Status,
+        "base text" | "base-text" => ::source_control::SourceControlCapability::BaseText,
+        "diff" => ::source_control::SourceControlCapability::Diff,
+        "commit" => ::source_control::SourceControlCapability::Commit,
+        "add" => ::source_control::SourceControlCapability::Add,
+        "delete" => ::source_control::SourceControlCapability::Delete,
+        "revert" => ::source_control::SourceControlCapability::Revert,
+        "resolve" => ::source_control::SourceControlCapability::Resolve,
+        "ignore" => ::source_control::SourceControlCapability::Ignore,
+        "update" => ::source_control::SourceControlCapability::Update,
+        "checkout" => ::source_control::SourceControlCapability::Checkout,
+        "switch" => ::source_control::SourceControlCapability::Switch,
+        "history" => ::source_control::SourceControlCapability::History,
+        "blame" => ::source_control::SourceControlCapability::Blame,
+        _ => return None,
+    })
 }
 
 impl From<StartDebuggingRequestArgumentsRequest>
@@ -617,13 +975,258 @@ impl HostWorktree for WasmState {
         Ok(delegate.which(binary_name).await)
     }
 
+    async fn run_command(
+        &mut self,
+        delegate: Resource<Arc<dyn WorktreeDelegate>>,
+        command: process::ScopedCommand,
+    ) -> wasmtime::Result<Result<process::Output, String>> {
+        let delegate = self.table.get(&delegate)?.clone();
+        let worktree_root = PathBuf::from(delegate.root_path());
+        if let Err(error) = self
+            .capability_granter
+            .grant_exec(&command.command, &command.args)
+        {
+            return Ok(Err(error.to_string()));
+        }
+        let host = self.host.clone();
+
+        maybe!(async move {
+            const MAX_STANDARD_INPUT_BYTES: usize = 8 * 1024 * 1024;
+            const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+
+            let requested_directory = if command.working_directory.is_empty() {
+                worktree_root.clone()
+            } else {
+                let requested_directory = PathBuf::from(&command.working_directory);
+                if requested_directory.is_absolute() {
+                    requested_directory
+                } else {
+                    worktree_root.join(requested_directory)
+                }
+            };
+            let normalized_directory = util::paths::normalize_lexically(&requested_directory)
+                .map_err(|_| anyhow!("working directory escapes its filesystem root"))?;
+            let canonical_root = host.fs.canonicalize(&worktree_root).await?;
+            let canonical_directory = host.fs.canonicalize(&normalized_directory).await?;
+            anyhow::ensure!(
+                canonical_directory.starts_with(&canonical_root),
+                "working directory must be inside the selected worktree"
+            );
+
+            if command
+                .stdin
+                .as_ref()
+                .is_some_and(|stdin| stdin.len() > MAX_STANDARD_INPUT_BYTES)
+            {
+                bail!("command standard input exceeds the 8 MiB limit");
+            }
+
+            let executable = delegate
+                .which(command.command.clone())
+                .await
+                .ok_or_else(|| anyhow!("command is not available in the selected worktree"))?;
+            let mut environment = delegate
+                .shell_env()
+                .await
+                .into_iter()
+                .filter(|(name, _)| scoped_command_environment_variable_allowed(name))
+                .collect::<BTreeMap<_, _>>();
+            for (name, value) in command.env {
+                anyhow::ensure!(
+                    scoped_command_environment_override_allowed(&name),
+                    "environment variable {name:?} is not allowed for a scoped command"
+                );
+                environment.insert(name, value);
+            }
+
+            let mut process = util::command::new_command(executable);
+            process
+                .args(&command.args)
+                .env_clear()
+                .envs(environment)
+                .current_dir(canonical_directory)
+                .stdout(util::command::Stdio::piped())
+                .stderr(util::command::Stdio::piped())
+                .kill_on_drop(true);
+            if command.stdin.is_some() {
+                process.stdin(util::command::Stdio::piped());
+            }
+            let mut child = process.spawn()?;
+            if let Some(stdin) = command.stdin {
+                let stdin = zeroize::Zeroizing::new(stdin);
+                let mut child_stdin = child
+                    .stdin
+                    .take()
+                    .context("failed to open command standard input")?;
+                child_stdin.write_all(stdin.as_slice()).await?;
+                child_stdin.close().await?;
+            }
+            let stdout = child
+                .stdout
+                .take()
+                .context("failed to open command standard output")?;
+            let stderr = child
+                .stderr
+                .take()
+                .context("failed to open command standard error")?;
+            let captured_bytes = Arc::new(AtomicUsize::new(0));
+            let status = child.status();
+            let (stdout, stderr, status) = futures::try_join!(
+                read_bounded_command_output(stdout, captured_bytes.clone(), MAX_OUTPUT_BYTES,),
+                read_bounded_command_output(stderr, captured_bytes, MAX_OUTPUT_BYTES),
+                async { status.await.map_err(anyhow::Error::from) },
+            )?;
+            let output = std::process::Output {
+                status,
+                stdout,
+                stderr,
+            };
+            Ok(output.into())
+        })
+        .await
+        .to_wasmtime_result()
+    }
+
     async fn drop(&mut self, _worktree: Resource<Worktree>) -> Result<()> {
         // We only ever hand out borrows of worktrees.
         Ok(())
     }
 }
 
+async fn read_bounded_command_output(
+    mut reader: impl futures::AsyncRead + Unpin,
+    captured_bytes: Arc<AtomicUsize>,
+    maximum_bytes: usize,
+) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut buffer = [0; 8192];
+    loop {
+        let bytes_read = reader.read(&mut buffer).await?;
+        if bytes_read == 0 {
+            return Ok(output);
+        }
+        let previous_bytes = captured_bytes.fetch_add(bytes_read, Ordering::Relaxed);
+        anyhow::ensure!(
+            previous_bytes.saturating_add(bytes_read) <= maximum_bytes,
+            "command output exceeds the 16 MiB limit"
+        );
+        output.extend_from_slice(&buffer[..bytes_read]);
+    }
+}
+
+fn scoped_command_environment_variable_allowed(name: &str) -> bool {
+    let uppercase_name = name.to_ascii_uppercase();
+    matches!(
+        uppercase_name.as_str(),
+        "APPDATA"
+            | "COMSPEC"
+            | "HOME"
+            | "LANG"
+            | "LANGUAGE"
+            | "LC_ALL"
+            | "LC_CTYPE"
+            | "LOCALAPPDATA"
+            | "PATH"
+            | "PATHEXT"
+            | "SSH_AUTH_SOCK"
+            | "SSL_CERT_DIR"
+            | "SSL_CERT_FILE"
+            | "SVN_ASP_DOT_NET_HACK"
+            | "SVN_SSH"
+            | "SYSTEMROOT"
+            | "TEMP"
+            | "TMP"
+            | "TMPDIR"
+            | "TZ"
+            | "USERPROFILE"
+            | "WINDIR"
+    ) || uppercase_name.starts_with("LC_")
+}
+
+fn scoped_command_environment_override_allowed(name: &str) -> bool {
+    let uppercase_name = name.to_ascii_uppercase();
+    matches!(
+        uppercase_name.as_str(),
+        "LANG" | "LANGUAGE" | "LC_ALL" | "LC_CTYPE" | "TZ"
+    ) || uppercase_name.starts_with("LC_")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        read_bounded_command_output, scoped_command_environment_override_allowed,
+        scoped_command_environment_variable_allowed,
+    };
+    use futures::executor::block_on;
+    use std::sync::{Arc, atomic::AtomicUsize};
+
+    #[test]
+    fn scoped_command_output_is_bounded_while_reading() -> anyhow::Result<()> {
+        let captured_bytes = Arc::new(AtomicUsize::new(0));
+        let output = block_on(read_bounded_command_output(
+            futures::io::Cursor::new(b"four"),
+            captured_bytes.clone(),
+            4,
+        ))?;
+        assert_eq!(output, b"four");
+
+        let error = block_on(read_bounded_command_output(
+            futures::io::Cursor::new(b"more"),
+            captured_bytes,
+            4,
+        ))
+        .expect_err("combined command output should be bounded");
+        assert!(error.to_string().contains("exceeds"));
+        Ok(())
+    }
+
+    #[test]
+    fn scoped_commands_receive_only_explicitly_allowed_environment_variables() {
+        for allowed in [
+            "HOME",
+            "LANG",
+            "LC_MESSAGES",
+            "Path",
+            "SystemRoot",
+            "SVN_SSH",
+            "TEMP",
+        ] {
+            assert!(
+                scoped_command_environment_variable_allowed(allowed),
+                "expected {allowed} to be allowed"
+            );
+        }
+
+        for denied in [
+            "AWS_SECRET_ACCESS_KEY",
+            "GITHUB_TOKEN",
+            "OPENAI_API_KEY",
+            "PASSWORD",
+        ] {
+            assert!(
+                !scoped_command_environment_variable_allowed(denied),
+                "expected {denied} to be denied"
+            );
+        }
+
+        for denied_override in ["HOME", "PATH", "SSH_AUTH_SOCK", "SSL_CERT_FILE", "SVN_SSH"] {
+            assert!(
+                !scoped_command_environment_override_allowed(denied_override),
+                "expected {denied_override} override to be denied"
+            );
+        }
+        for allowed_override in ["LANG", "LC_MESSAGES", "TZ"] {
+            assert!(
+                scoped_command_environment_override_allowed(allowed_override),
+                "expected {allowed_override} override to be allowed"
+            );
+        }
+    }
+}
+
 impl common::Host for WasmState {}
+
+impl source_control::Host for WasmState {}
 
 impl http_client::Host for WasmState {
     async fn fetch(

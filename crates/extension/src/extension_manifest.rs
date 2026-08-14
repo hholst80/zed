@@ -108,6 +108,8 @@ pub struct ExtensionManifest {
     pub language_servers: BTreeMap<LanguageServerName, LanguageServerManifestEntry>,
     #[serde(default)]
     pub context_servers: BTreeMap<Arc<str>, ContextServerManifestEntry>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub source_control_providers: BTreeMap<Arc<str>, SourceControlProviderManifestEntry>,
     #[serde(default)]
     pub slash_commands: BTreeMap<Arc<str>, SlashCommandManifestEntry>,
     #[serde(default)]
@@ -150,6 +152,10 @@ impl ExtensionManifest {
             provides.insert(ExtensionProvides::ContextServers);
         }
 
+        if !self.source_control_providers.is_empty() {
+            provides.insert(ExtensionProvides::SourceControlProviders);
+        }
+
         if self.snippets.is_some() {
             provides.insert(ExtensionProvides::Snippets);
         }
@@ -189,9 +195,15 @@ impl ExtensionManifest {
     pub fn remote_load(&self) -> Option<RemoteLoad<'_>> {
         (!self.language_servers.is_empty()
             || !self.debug_adapters.is_empty()
-            || !self.debug_locators.is_empty())
+            || !self.debug_locators.is_empty()
+            || !self.source_control_providers.is_empty())
         .then_some(RemoteLoad { manifest: self })
     }
+}
+
+#[derive(Clone, PartialEq, Eq, Debug, Deserialize, Serialize)]
+pub struct SourceControlProviderManifestEntry {
+    pub display_name: String,
 }
 
 pub struct RemoteLoad<'a> {
@@ -450,6 +462,7 @@ fn manifest_from_old_manifest(
             .collect(),
         language_servers: Default::default(),
         context_servers: BTreeMap::default(),
+        source_control_providers: BTreeMap::default(),
         slash_commands: BTreeMap::default(),
         snippets: None,
         capabilities: Vec::new(),
@@ -484,6 +497,7 @@ mod tests {
             grammars: BTreeMap::default(),
             language_servers: BTreeMap::default(),
             context_servers: BTreeMap::default(),
+            source_control_providers: BTreeMap::default(),
             slash_commands: BTreeMap::default(),
             snippets: None,
             capabilities: vec![],
@@ -587,6 +601,26 @@ mod tests {
                 .is_ok()
         );
         assert!(manifest.allow_exec("docker", &["ps"]).is_err()); // wrong first arg
+    }
+
+    #[test]
+    fn source_control_providers_are_reported_and_remote_loadable() {
+        let manifest = ExtensionManifest {
+            source_control_providers: BTreeMap::from([(
+                Arc::from("subversion"),
+                SourceControlProviderManifestEntry {
+                    display_name: "Subversion".to_owned(),
+                },
+            )]),
+            ..extension_manifest()
+        };
+
+        assert!(
+            manifest
+                .provides()
+                .contains(&ExtensionProvides::SourceControlProviders)
+        );
+        assert!(manifest.remote_load().is_some());
     }
 
     #[test]
