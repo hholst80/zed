@@ -490,14 +490,7 @@ impl SourceControlProvider for SvnProvider<'_> {
         let output = self
             .run_checked(&SvnCommand::new(
                 state.execution_directory.clone(),
-                [
-                    "status",
-                    "--xml",
-                    "--ignore-externals",
-                    "--no-ignore",
-                    "--",
-                    &target,
-                ],
+                ["status", "--xml", "--ignore-externals", "--", &target],
             ))
             .map_err(source_control_error)?;
         let xml = output_utf8(&output).map_err(source_control_error)?;
@@ -1534,9 +1527,22 @@ mod tests {
                     },
                 )
                 .await?;
-            assert!(provider.status(repository).await?.iter().any(|status| {
-                status.path.as_str() == "src/generated.tmp"
-                    && status.content_status == SourceControlContentStatus::Ignored
+            assert!(
+                !provider
+                    .status(repository)
+                    .await?
+                    .iter()
+                    .any(|status| status.path.as_str() == "src/generated.tmp"),
+                "normal status should hide ignored paths"
+            );
+            let ignored_output = Command::new("svn")
+                .current_dir(&working_copy_path)
+                .args(["status", "--no-ignore", "--", "src/generated.tmp"])
+                .output()?;
+            assert!(ignored_output.status.success());
+            let ignored_stdout = String::from_utf8(ignored_output.stdout)?;
+            assert!(ignored_stdout.lines().any(|line| {
+                line.starts_with('I') && line.trim_end().ends_with("src/generated.tmp")
             }));
             let ignore_diff = provider
                 .diff(repository, &source_directory)
