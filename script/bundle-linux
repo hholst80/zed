@@ -12,11 +12,13 @@ Build a release .tar.gz for Linux.
 Options:
   -h, --help        Display this help and exit.
   --flatpak         Set ZED_BUNDLE_TYPE=flatpak so that this can be included in system info
+  --skip-remote-server  Omit the separate remote/SSH server
   --require-sentry  Require Sentry credentials, CLI, and successful symbol upload (official releases).
   --skip-sentry     Skip symbol upload for local packaging; incompatible with --require-sentry.
   "
 }
 
+build_remote_server=true
 require_sentry=false
 skip_sentry=false
 
@@ -29,6 +31,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --flatpak)
             export ZED_BUNDLE_TYPE=flatpak
+            shift
+            ;;
+        --skip-remote-server)
+            build_remote_server=false
             shift
             ;;
         --require-sentry)
@@ -109,11 +115,11 @@ fi
 # Generate the licenses first, so they can be baked into the binaries
 script/generate-licenses
 
-if "$rustup_installed"; then
+if "$rustup_installed" && "$build_remote_server"; then
     rustup target add "$remote_server_triple"
 fi
 
-export CC=${CC:-$(which clang)}
+export CC=${CC:-$(type -p clang)}
 lld=${LLD:-$("$CC" -print-prog-name=ld.lld)}
 if [[ "$lld" != /* || ! -x "$lld" ]]; then
     echo "Bundling requires an absolute executable linker path; set LLD (e.g. LLD=/usr/bin/ld.lld-18)." >&2
@@ -130,21 +136,26 @@ cargo --config .cargo/bundle-config.toml rustc --release --target "${target_trip
 cargo --config .cargo/bundle-config.toml build --release --target "${target_triple}" --package cli
 # Build remote_server in separate invocation to prevent feature unification from other crates
 # from influencing dynamic libraries required by it.
+if "$build_remote_server"; then
 if [[ "$remote_server_triple" == "$musl_triple" ]]; then
     musl_cc_var="CC_$(echo "$remote_server_triple" | tr '-' '_')"
     export "$musl_cc_var"=musl-gcc
 fi
 cargo --config .cargo/bundle-config.toml build --release --target "${remote_server_triple}" --package remote_server
+fi
 
 if ! "$skip_sentry"; then
     echo "Uploading zed debug symbols to sentry..."
     # Sentry needs the full ELF for .eh_frame unwinding, not just the debug
     # companion. See https://github.com/getsentry/symbolic/issues/783.
+    debug_files=("${target_dir}/${target_triple}/release/zed")
+    if "$build_remote_server"; then
+        debug_files+=("${target_dir}/${remote_server_triple}/release/remote_server")
+    fi
     for attempt in 1 2 3; do
         echo "Attempting sentry upload (attempt $attempt/3)..."
         if sentry-cli debug-files upload --include-sources --wait -p zed -o zed-dev \
-            "${target_dir}/${target_triple}"/release/zed \
-            "${target_dir}/${remote_server_triple}"/release/remote_server; then
+            "${debug_files[@]}"; then
             echo "Sentry upload successful on attempt $attempt"
             break
         fi
@@ -163,10 +174,12 @@ fi
 # We use llvm-objcopy because GNU objcopy on older distros (e.g. Ubuntu 20.04)
 # doesn't understand CREL sections produced by newer LLVM.
 llvm-objcopy --only-keep-debug "${target_dir}/${target_triple}/release/zed" "${target_dir}/${target_triple}/release/zed.dbg"
-llvm-objcopy --only-keep-debug "${target_dir}/${remote_server_triple}/release/remote_server" "${target_dir}/${remote_server_triple}/release/remote_server.dbg"
+if "$build_remote_server"; then
+    llvm-objcopy --only-keep-debug "${target_dir}/${remote_server_triple}/release/remote_server" "${target_dir}/${remote_server_triple}/release/remote_server.dbg"
+fi
 
 # Ensure that remote_server does not depend on libssl nor libcrypto, as we got rid of these deps.
-if ldd "${target_dir}/${remote_server_triple}/release/remote_server" | grep -q 'libcrypto\|libssl'; then
+if "$build_remote_server" && ldd "${target_dir}/${remote_server_triple}/release/remote_server" | grep -q 'libcrypto\|libssl'; then
     if [[ "$remote_server_triple" == *-musl ]]; then
         echo "Error: remote_server still depends on libssl or libcrypto" && exit 1
     else
@@ -190,7 +203,9 @@ zed_dir="${temp_dir}/zed$suffix.app"
 mkdir -p "${zed_dir}/bin" "${zed_dir}/libexec"
 llvm-objcopy --strip-unneeded "${target_dir}/${target_triple}/release/zed" "${zed_dir}/libexec/zed-editor"
 llvm-objcopy --strip-debug --discard-all "${target_dir}/${target_triple}/release/cli" "${zed_dir}/bin/zed"
-llvm-objcopy --strip-debug --discard-all "${target_dir}/${remote_server_triple}/release/remote_server" "${temp_dir}/remote_server"
+if "$build_remote_server"; then
+    llvm-objcopy --strip-debug --discard-all "${target_dir}/${remote_server_triple}/release/remote_server" "${temp_dir}/remote_server"
+fi
 
 # Libs
 # Bundle libstdc++ so older supported systems can run binaries built with our
@@ -251,4 +266,6 @@ remove_match="zed(-[a-zA-Z0-9]+)?-linux-$(uname -m)\.tar\.gz"
 ls "${target_dir}/release" | grep -E ${remove_match} | xargs -d "\n" -I {} rm -f "${target_dir}/release/{}" || true
 tar -czvf "${target_dir}/release/$archive" -C ${temp_dir} "zed$suffix.app"
 
-gzip -f --stdout --best "${temp_dir}/remote_server" > "${target_dir}/zed-remote-server-linux-${arch}.gz"
+if "$build_remote_server"; then
+    gzip -f --stdout --best "${temp_dir}/remote_server" > "${target_dir}/zed-remote-server-linux-${arch}.gz"
+fi

@@ -31,9 +31,12 @@ RUN chmod +x /tmp/zed-build/script/linux \
 # targets, including wasm32-wasip2 for extension builds.
 COPY rust-toolchain.toml /tmp/zed-toolchain/rust-toolchain.toml
 WORKDIR /tmp/zed-toolchain
+ARG CARGO_ABOUT_VERSION=0.8.2
 RUN rustup show active-toolchain \
     && cargo --version \
     && rustc --version \
+    && cargo install --locked "cargo-about@${CARGO_ABOUT_VERSION}" \
+    && cargo about --version \
     && svn --version --quiet
 
 ARG USERNAME=zed

@@ -46,11 +46,39 @@ suites, `bundle` for Zed's Linux release archive, `shell` for an interactive
 development environment, or `image` to build only the image. Pass
 `--no-image-build` to reuse an image without checking for Dockerfile changes.
 
+The default `build` mode produces development binaries whose shared libraries
+remain in the container. To create the same batteries-included application
+layout as Zed's official Linux installer, build and unpack a local release:
+
+```sh
+./script/build-zed-container install
+./target/container/local/zed
+```
+
+The stable launcher resolves through `target/container/local/current` to a
+commit- and archive-specific application under `local/builds`. Rebuilding does
+not overwrite an existing build. This installation is entirely beneath the
+ignored `target/container` directory and does not read, replace, or otherwise
+modify an existing `~/.local/zed.app` reference installation. The release SVN
+WASM artifact remains available under
+`target/container/wasm32-wasip2/release/zed_svn.wasm`; install
+`extensions/svn` through the modified Zed's development-extension action.
+Release/LTO compilation is memory-intensive, so bundle and install modes use
+one Cargo job by default. Set `ZED_BUILD_JOBS` to a higher positive integer on
+a host with sufficient memory. The archive-only `bundle` mode retains Zed's
+canonical thin-LTO release profile and includes the separate static remote/SSH
+server. The local `install` mode skips that unrelated second target, disables
+LTO, uses 16 code-generation units, and omits debug information so it can build
+on an 11 GiB development host; its desktop features and bundled-library layout
+are unchanged.
+
 The checked-in `.devcontainer/devcontainer.json` uses the same image and bind
 mount. Open the repository as a dev container from Zed or another compatible
-editor; Cargo registry and Git caches are kept in named volumes while build
-outputs stay in the host workspace. On Linux, `updateRemoteUserUID` maps the
-unprivileged `zed` user to a normal host user's UID.
+editor. The image preinstalls the `cargo-about` version required by Zed's
+bundle license generator. Cargo registry and Git caches are kept in named
+volumes while build outputs stay in the host workspace. On Linux,
+`updateRemoteUserUID` maps the unprivileged `zed` user to a normal host user's
+UID.
 
 For the unusual case of a checkout owned by host UID 0, use
 `./script/build-zed-container` or its `shell` mode. The script preserves root
