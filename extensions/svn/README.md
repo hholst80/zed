@@ -16,6 +16,9 @@ selected-path commits, add, schedule delete, revert, resolve, ignore, update,
 switch, checkout, history, blame, base text, one-shot credential prompts, and
 one-shot TLS certificate trust.
 
+Normal status follows `svn status` and omits ignored paths. Use
+`svn status --no-ignore` explicitly when inspecting ignore rules outside Zed.
+
 Run its native and WebAssembly checks from the Zed repository root:
 
 ```sh
