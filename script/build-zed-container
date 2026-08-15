@@ -195,70 +195,7 @@ else
 fi
 
 if [[ "${mode}" == install ]]; then
-    channel="$(tr -d '\r\n' < "${repository_root}/crates/zed/RELEASE_CHANNEL")"
-    if [[ ! "${channel}" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-        echo "Invalid Zed release channel: ${channel}" >&2
-        exit 1
-    fi
-
-    app_suffix=""
-    if [[ "${channel}" != stable ]]; then
-        app_suffix="-${channel}"
-    fi
-    app_name="zed${app_suffix}.app"
-    archive="${repository_root}/target/container/release/zed-linux-$(uname -m).tar.gz"
-    local_root="${repository_root}/target/container/local"
-    builds_root="${local_root}/builds"
-
-    if [[ ! -f "${archive}" ]]; then
-        echo "Linux bundle archive was not produced: ${archive}" >&2
-        exit 1
-    fi
-    mkdir -p "${builds_root}"
-
-    bundle_hash="$(sha256sum "${archive}" | cut -c1-12)"
-    commit="$(git -C "${repository_root}" rev-parse --short=12 HEAD)"
-    build_id="${commit}-${bundle_hash}"
-    install_directory="${builds_root}/${build_id}"
-    installed_app="${install_directory}/${app_name}"
-
-    if [[ -e "${install_directory}" ]]; then
-        if [[ ! -x "${installed_app}/bin/zed" || ! -x "${installed_app}/libexec/zed-editor" ]]; then
-            echo "Existing local install is incomplete: ${install_directory}" >&2
-            exit 1
-        fi
-    else
-        staging_directory="$(mktemp -d "${builds_root}/.install.XXXXXX")"
-        cleanup_staging() {
-            if [[ -d "${staging_directory}" ]]; then
-                find -P "${staging_directory}" -depth -delete
-            fi
-        }
-        trap cleanup_staging EXIT
-        tar -xzf "${archive}" -C "${staging_directory}"
-        if [[ ! -x "${staging_directory}/${app_name}/bin/zed" \
-            || ! -x "${staging_directory}/${app_name}/libexec/zed-editor" ]]; then
-            echo "Linux bundle does not contain the expected ${app_name} layout" >&2
-            exit 1
-        fi
-        mv "${staging_directory}" "${install_directory}"
-        trap - EXIT
-    fi
-
-    if [[ -e "${local_root}/current" && ! -L "${local_root}/current" ]]; then
-        echo "Refusing to replace non-symlink: ${local_root}/current" >&2
-        exit 1
-    fi
-    if [[ -e "${local_root}/zed" && ! -L "${local_root}/zed" ]]; then
-        echo "Refusing to replace non-symlink: ${local_root}/zed" >&2
-        exit 1
-    fi
-    ln -sfn "builds/${build_id}/${app_name}" "${local_root}/current"
-    ln -sfn "current/bin/zed" "${local_root}/zed"
-
-    echo "Local Zed application: ${installed_app}"
-    echo "Local Zed launcher: ${local_root}/zed"
-    echo "SVN extension: ${repository_root}/target/container/wasm32-wasip2/release/zed_svn.wasm"
+    "${repository_root}/script/install-zed-local"
 elif [[ "${mode}" == build ]]; then
     echo "Zed artifact: ${repository_root}/target/container/${profile}/zed"
     echo "CLI artifact: ${repository_root}/target/container/${profile}/cli"

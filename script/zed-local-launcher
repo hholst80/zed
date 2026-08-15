@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+launcher_path="$(readlink -f -- "${BASH_SOURCE[0]}")"
+app_root="$(cd -- "$(dirname -- "${launcher_path}")/.." && pwd)"
+local_root="$(cd -- "${app_root}/../../.." && pwd)"
+
+exec "${app_root}/bin/zed" --user-data-dir "${local_root}/user-data" "$@"
