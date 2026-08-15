@@ -4,8 +4,10 @@ This in-tree extension provides the Subversion adapter for Zed's experimental
 source-control provider API. It requires a system `svn` client at version 1.14
 or newer in the 1.x series and a Dev or Nightly build of this branch.
 
-Install it as a development extension by running the
-`zed: install dev extension` action and selecting this directory. For remote
+Source developers with a host Rust toolchain can install this directory with
+the `zed: install dev extension` action. Users of the container-built local
+application should not do that: its launcher already selects an isolated
+profile containing the precompiled extension, as described below. For remote
 projects, `svn` must be available on the remote host because commands run next
 to the working copy.
 
@@ -56,13 +58,17 @@ layout as Zed's official Linux installer, build and unpack a local release:
 ```
 
 The stable launcher resolves through `target/container/local/current` to a
-commit- and archive-specific application under `local/builds`. Rebuilding does
+commit- and payload-specific application under `local/builds`. Rebuilding does
 not overwrite an existing build. This installation is entirely beneath the
 ignored `target/container` directory and does not read, replace, or otherwise
-modify an existing `~/.local/zed.app` reference installation. The release SVN
-WASM artifact remains available under
-`target/container/wasm32-wasip2/release/zed_svn.wasm`; install
-`extensions/svn` through the modified Zed's development-extension action.
+modify an existing `~/.local/zed.app` reference installation. The installer
+packages the already compiled SVN WASM component into the application and
+preinstalls it in an isolated profile at `target/container/local/user-data`.
+The launcher selects that profile automatically, so normal use does not need a
+host Rust toolchain and must not use Zed's source-compiling **Install Dev
+Extension** action. To restage existing release artifacts without compiling,
+run `./script/install-zed-local`. The release SVN WASM artifact also remains at
+`target/container/wasm32-wasip2/release/zed_svn.wasm`.
 Release/LTO compilation is memory-intensive, so bundle and install modes use
 one Cargo job by default. Set `ZED_BUILD_JOBS` to a higher positive integer on
 a host with sufficient memory. The archive-only `bundle` mode retains Zed's
