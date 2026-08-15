@@ -14,6 +14,7 @@ Modes:
   build             Build Zed, its CLI, and the SVN extension (default)
   test              Run the source-control and SVN test suites
   bundle            Build Zed's release Linux archive
+  install           Build and unpack a bundled local Zed application
   shell             Open an interactive shell in the build container
   image              Build only the container image
 
@@ -27,6 +28,7 @@ Environment:
   CONTAINER_ENGINE       Default container engine
   ZED_BUILD_IMAGE        Image tag (default: zed-subversion-build:local)
   ZED_BUILD_BASE_IMAGE   Base image (default: ubuntu:24.04)
+  ZED_BUILD_JOBS         Cargo jobs for bundle/install (default: 1)
 EOF
 }
 
@@ -37,10 +39,11 @@ build_image=true
 engine="${CONTAINER_ENGINE:-}"
 image="${ZED_BUILD_IMAGE:-zed-subversion-build:local}"
 base_image="${ZED_BUILD_BASE_IMAGE:-ubuntu:24.04}"
+bundle_jobs="${ZED_BUILD_JOBS:-1}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        build|test|bundle|shell|image)
+        build|test|bundle|install|shell|image)
             if [[ "${mode_was_set}" == true ]]; then
                 echo "Only one mode can be selected" >&2
                 usage >&2
@@ -93,6 +96,13 @@ if [[ "${engine}" != docker && "${engine}" != podman ]]; then
     echo "Unsupported container engine: ${engine}" >&2
     exit 2
 fi
+
+if [[ "${mode}" == bundle || "${mode}" == install ]]; then
+    if [[ ! "${bundle_jobs}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ZED_BUILD_JOBS must be a positive integer" >&2
+        exit 2
+    fi
+fi
 if ! type -p "${engine}" >/dev/null 2>&1; then
     echo "Container engine is not available: ${engine}" >&2
     exit 1
@@ -143,7 +153,14 @@ case "${mode}" in
         container_command="cargo test --locked ${cargo_profile_flag} -p source_control -p zed_svn"
         ;;
     bundle)
-        container_command="./script/bundle-linux"
+        container_command="export CARGO_BUILD_JOBS=${bundle_jobs}; ./script/bundle-linux && cargo build --locked --release -p zed_svn --target wasm32-wasip2"
+        profile=release
+        ;;
+    install)
+        # Zed's canonical thin-LTO release profile can exceed 11 GiB even with
+        # one Cargo job. A local development install keeps release optimization
+        # while using the workspace's memory-friendlier codegen shape.
+        container_command="export CARGO_BUILD_JOBS=${bundle_jobs} CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 CARGO_PROFILE_RELEASE_DEBUG=0; ./script/bundle-linux --skip-remote-server && cargo build --locked --release -p zed_svn --target wasm32-wasip2"
         profile=release
         ;;
     shell)
@@ -177,10 +194,76 @@ else
     "${engine}" "${run_arguments[@]}" "${image}" /bin/bash -lc "${container_command}"
 fi
 
-if [[ "${mode}" == build ]]; then
+if [[ "${mode}" == install ]]; then
+    channel="$(tr -d '\r\n' < "${repository_root}/crates/zed/RELEASE_CHANNEL")"
+    if [[ ! "${channel}" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        echo "Invalid Zed release channel: ${channel}" >&2
+        exit 1
+    fi
+
+    app_suffix=""
+    if [[ "${channel}" != stable ]]; then
+        app_suffix="-${channel}"
+    fi
+    app_name="zed${app_suffix}.app"
+    archive="${repository_root}/target/container/release/zed-linux-$(uname -m).tar.gz"
+    local_root="${repository_root}/target/container/local"
+    builds_root="${local_root}/builds"
+
+    if [[ ! -f "${archive}" ]]; then
+        echo "Linux bundle archive was not produced: ${archive}" >&2
+        exit 1
+    fi
+    mkdir -p "${builds_root}"
+
+    bundle_hash="$(sha256sum "${archive}" | cut -c1-12)"
+    commit="$(git -C "${repository_root}" rev-parse --short=12 HEAD)"
+    build_id="${commit}-${bundle_hash}"
+    install_directory="${builds_root}/${build_id}"
+    installed_app="${install_directory}/${app_name}"
+
+    if [[ -e "${install_directory}" ]]; then
+        if [[ ! -x "${installed_app}/bin/zed" || ! -x "${installed_app}/libexec/zed-editor" ]]; then
+            echo "Existing local install is incomplete: ${install_directory}" >&2
+            exit 1
+        fi
+    else
+        staging_directory="$(mktemp -d "${builds_root}/.install.XXXXXX")"
+        cleanup_staging() {
+            if [[ -d "${staging_directory}" ]]; then
+                find -P "${staging_directory}" -depth -delete
+            fi
+        }
+        trap cleanup_staging EXIT
+        tar -xzf "${archive}" -C "${staging_directory}"
+        if [[ ! -x "${staging_directory}/${app_name}/bin/zed" \
+            || ! -x "${staging_directory}/${app_name}/libexec/zed-editor" ]]; then
+            echo "Linux bundle does not contain the expected ${app_name} layout" >&2
+            exit 1
+        fi
+        mv "${staging_directory}" "${install_directory}"
+        trap - EXIT
+    fi
+
+    if [[ -e "${local_root}/current" && ! -L "${local_root}/current" ]]; then
+        echo "Refusing to replace non-symlink: ${local_root}/current" >&2
+        exit 1
+    fi
+    if [[ -e "${local_root}/zed" && ! -L "${local_root}/zed" ]]; then
+        echo "Refusing to replace non-symlink: ${local_root}/zed" >&2
+        exit 1
+    fi
+    ln -sfn "builds/${build_id}/${app_name}" "${local_root}/current"
+    ln -sfn "current/bin/zed" "${local_root}/zed"
+
+    echo "Local Zed application: ${installed_app}"
+    echo "Local Zed launcher: ${local_root}/zed"
+    echo "SVN extension: ${repository_root}/target/container/wasm32-wasip2/release/zed_svn.wasm"
+elif [[ "${mode}" == build ]]; then
     echo "Zed artifact: ${repository_root}/target/container/${profile}/zed"
     echo "CLI artifact: ${repository_root}/target/container/${profile}/cli"
     echo "SVN extension: ${repository_root}/target/container/wasm32-wasip2/${profile}/zed_svn.wasm"
 elif [[ "${mode}" == bundle ]]; then
     echo "Linux bundle directory: ${repository_root}/target/container/release"
+    echo "SVN extension: ${repository_root}/target/container/wasm32-wasip2/release/zed_svn.wasm"
 fi
