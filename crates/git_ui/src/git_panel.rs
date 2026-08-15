@@ -9015,7 +9015,45 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let result = self.resolve_source_control_project_path(&key, &path, cx);
+        let (repository, provider_name, project_path) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.show_error(format!("Opening source-control diff failed: {error}"), cx)
+                });
+                return;
+            }
+        };
+
+        SoloDiffView::open_source_control(
+            repository,
+            path,
+            project_path,
+            provider_name,
+            workspace.downgrade(),
+            window,
+            cx,
+        )
+        .detach_and_notify_err(workspace.downgrade(), window, cx);
+    }
+
+    fn show_source_control_property_diff(
+        &mut self,
+        key: SourceControlRepositoryKey,
+        path: SourceControlPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let source_control_store = self.project.read(cx).source_control_store().clone();
+        let provider_name = source_control_store.read_with(cx, |store, cx| {
+            store
+                .provider_display_name(&key.provider_id, cx)
+                .unwrap_or_else(|| Arc::from(key.provider_id.as_str().to_owned()))
+        });
         let task = source_control_store.update(cx, |store, cx| store.diff(&key, path.clone(), cx));
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
@@ -9023,11 +9061,11 @@ impl GitPanel {
                 Ok(diff) => {
                     let output = diff
                         .as_deref()
-                        .unwrap_or("No text or property differences were reported.");
+                        .unwrap_or("No property differences were reported.");
                     if let Some(workspace) = this.workspace.upgrade() {
                         workspace.update(cx, |workspace, cx| {
                             open_named_output(
-                                format!("Subversion diff: {}", path.as_str()),
+                                format!("{provider_name} property diff: {}", path.as_str()),
                                 workspace,
                                 output,
                                 window,
@@ -9039,8 +9077,10 @@ impl GitPanel {
                 Err(error) => {
                     if let Some(workspace) = this.workspace.upgrade() {
                         workspace.update(cx, |workspace, cx| {
-                            workspace
-                                .show_error(format!("Loading Subversion diff failed: {error}"), cx)
+                            workspace.show_error(
+                                format!("Loading {provider_name} property diff failed: {error}"),
+                                cx,
+                            )
                         });
                     }
                 }
@@ -9057,51 +9097,99 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let result = self.resolve_source_control_project_path(&key, &path, cx);
+        let (repository, _provider_name, project_path) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                workspace.update(cx, |workspace, cx| {
+                    workspace
+                        .show_error(format!("Opening source-control blame failed: {error}"), cx)
+                });
+                return;
+            }
+        };
         let source_control_store = self.project.read(cx).source_control_store().clone();
         let task = source_control_store.update(cx, |store, cx| store.blame(&key, path.clone(), cx));
-        cx.spawn_in(window, async move |this, cx| {
-            let result = task.await;
-            this.update_in(cx, |this, window, cx| match result {
-                Ok(lines) => {
-                    let output = lines
-                        .into_iter()
-                        .map(|line| {
-                            format!(
-                                "{:>6}  {:>8}  {}  {}",
-                                line.line_number,
-                                line.revision
-                                    .as_ref()
-                                    .map(|revision| revision.display.as_ref())
-                                    .unwrap_or("-"),
-                                line.author.as_deref().unwrap_or("unknown"),
-                                line.timestamp.as_deref().unwrap_or("unknown time")
-                            )
-                        })
-                        .join("\n");
-                    if let Some(workspace) = this.workspace.upgrade() {
-                        workspace.update(cx, |workspace, cx| {
-                            open_named_output(
-                                format!("Subversion blame: {}", path.as_str()),
-                                workspace,
-                                &output,
-                                window,
-                                cx,
-                            )
-                        });
-                    }
-                }
-                Err(error) => {
-                    if let Some(workspace) = this.workspace.upgrade() {
-                        workspace.update(cx, |workspace, cx| {
-                            workspace
-                                .show_error(format!("Loading Subversion blame failed: {error}"), cx)
-                        });
-                    }
-                }
-            })
-            .ok();
+        let fs = self.project.read(cx).fs().clone();
+        let absolute_path = repository
+            .repository
+            .working_copy_path
+            .join(Path::new(path.as_str()));
+        let workspace_handle = workspace.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            let reference_text = fs
+                .load(&absolute_path)
+                .await
+                .with_context(|| format!("failed to read {}", absolute_path.display()))?;
+            let lines = task.await?;
+            let entries = lines
+                .into_iter()
+                .map(|line| editor::RevisionBlameEntry {
+                    line_number: line.line_number,
+                    revision_id: line
+                        .revision
+                        .as_ref()
+                        .map(|revision| SharedString::from(revision.canonical.to_string())),
+                    revision_label: line
+                        .revision
+                        .as_ref()
+                        .map(|revision| SharedString::from(revision.display.to_string())),
+                    author: line
+                        .author
+                        .map(|author| SharedString::from(author.to_string())),
+                    timestamp: line
+                        .timestamp
+                        .map(|timestamp| SharedString::from(timestamp.to_string())),
+                })
+                .collect();
+            let item = workspace_handle
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.open_path(project_path, None, true, window, cx)
+                })?
+                .await?;
+            let editor = cx
+                .update(|_, cx| item.act_as::<Editor>(cx))?
+                .context("opened item is not an editor")?;
+            editor.update(cx, |editor, cx| {
+                editor.set_revision_blame(reference_text.into(), entries, cx)
+            });
+            anyhow::Ok(())
         })
-        .detach();
+        .detach_and_notify_err(workspace.downgrade(), window, cx);
+    }
+
+    fn resolve_source_control_project_path(
+        &self,
+        key: &SourceControlRepositoryKey,
+        path: &SourceControlPath,
+        cx: &App,
+    ) -> anyhow::Result<(SourceControlRepositorySnapshot, Arc<str>, ProjectPath)> {
+        let source_control_store = self.project.read(cx).source_control_store().clone();
+        let (repository, provider_name) = source_control_store.read_with(cx, |store, cx| {
+            let repository = store
+                .repository(key)
+                .cloned()
+                .context("source-control repository is no longer available")?;
+            let provider_name = store
+                .provider_display_name(&key.provider_id, cx)
+                .unwrap_or_else(|| Arc::from(key.provider_id.as_str().to_owned()));
+            anyhow::Ok((repository, provider_name))
+        })?;
+        let absolute_path = repository
+            .repository
+            .working_copy_path
+            .join(Path::new(path.as_str()));
+        let project_path = self
+            .project
+            .read(cx)
+            .project_path_for_absolute_path(&absolute_path, cx)
+            .with_context(|| {
+                format!("{} is outside the open worktrees", absolute_path.display())
+            })?;
+        Ok((repository, provider_name, project_path))
     }
 
     fn render_source_control_panel(
@@ -9322,12 +9410,10 @@ impl GitPanel {
         let blame_path = status.path.clone();
         let diff_key = key.clone();
         let diff_path = status.path.clone();
-        let can_show_diff = !matches!(
-            status.content_status,
-            SourceControlContentStatus::Unversioned
-                | SourceControlContentStatus::Ignored
-                | SourceControlContentStatus::External
-        );
+        let property_diff_key = key.clone();
+        let property_diff_path = status.path.clone();
+        let (can_show_diff, can_show_property_diff) =
+            source_control_diff_options(&status, capabilities);
         let metadata = source_control_status_metadata(&status);
         let is_versioned_file = status.node_kind == source_control::SourceControlNodeKind::File
             && !matches!(
@@ -9382,7 +9468,7 @@ impl GitPanel {
                 )
             })
             .child(div().flex_1())
-            .when(capabilities.diff && can_show_diff, |this| {
+            .when(can_show_diff, |this| {
                 this.child(
                     Button::new(
                         SharedString::from(format!("source-control-diff-{}", diff_path.as_str())),
@@ -9393,6 +9479,27 @@ impl GitPanel {
                         this.show_source_control_diff(
                             diff_key.clone(),
                             diff_path.clone(),
+                            window,
+                            cx,
+                        );
+                    })),
+                )
+            })
+            .when(can_show_property_diff, |this| {
+                this.child(
+                    Button::new(
+                        SharedString::from(format!(
+                            "source-control-property-diff-{}",
+                            property_diff_path.as_str()
+                        )),
+                        "Properties",
+                    )
+                    .label_size(LabelSize::Small)
+                    .tooltip(Tooltip::text("Show provider property diff"))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.show_source_control_property_diff(
+                            property_diff_key.clone(),
+                            property_diff_path.clone(),
                             window,
                             cx,
                         );
@@ -9636,6 +9743,27 @@ fn source_control_section(
     } else {
         SourceControlSection::Excluded
     }
+}
+
+fn source_control_diff_options(
+    status: &SourceControlStatusEntry,
+    capabilities: SourceControlCapabilities,
+) -> (bool, bool) {
+    let is_supported_status = !matches!(
+        status.content_status,
+        SourceControlContentStatus::Unversioned
+            | SourceControlContentStatus::Ignored
+            | SourceControlContentStatus::External
+    );
+    let content_diff = capabilities.diff
+        && capabilities.base_text
+        && status.node_kind == source_control::SourceControlNodeKind::File
+        && is_supported_status
+        && status.content_status != SourceControlContentStatus::Normal;
+    let property_diff = capabilities.diff
+        && is_supported_status
+        && status.property_status != SourceControlContentStatus::Normal;
+    (content_diff, property_diff)
 }
 
 fn source_control_status_code(status: &SourceControlStatusEntry) -> &'static str {
@@ -10596,6 +10724,16 @@ mod tests {
             source_control_status_color(&property_conflict),
             Color::Error
         );
+        let diff_capabilities = SourceControlCapabilities {
+            base_text: true,
+            diff: true,
+            ..SourceControlCapabilities::NONE
+        };
+        assert_eq!(
+            source_control_diff_options(&property_conflict, diff_capabilities),
+            (false, true),
+            "property-only changes use the provider details view"
+        );
 
         let missing = status(
             "missing.txt",
@@ -10639,6 +10777,11 @@ mod tests {
         assert_eq!(
             source_control_status_metadata(&metadata).as_deref(),
             Some("copied · switched · locked · tree conflict · out of date")
+        );
+        assert_eq!(
+            source_control_diff_options(&metadata, diff_capabilities),
+            (true, false),
+            "text changes use the integrated editor diff"
         );
         Ok(())
     }
