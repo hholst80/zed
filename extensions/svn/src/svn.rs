@@ -1502,6 +1502,25 @@ mod tests {
             assert_eq!(blame.len(), 1);
             assert!(blame[0].revision.is_some());
 
+            fs::write(
+                working_copy_path.join("src/tracked.txt"),
+                "local-only line\nsecond\n",
+            )?;
+            let blame_with_local_edits = provider.blame(repository, &tracked_path).await?;
+            assert_eq!(
+                blame_with_local_edits.len(),
+                2,
+                "svn blame should use the working-copy line layout"
+            );
+            assert!(
+                blame_with_local_edits[0].revision.is_none(),
+                "locally added lines should have no revision"
+            );
+            assert!(
+                blame_with_local_edits[1].revision.is_some(),
+                "unchanged working-copy lines should retain their revision"
+            );
+
             fs::write(working_copy_path.join("src/tracked.txt"), "discard me\n")?;
             provider
                 .execute(
@@ -1606,6 +1625,11 @@ mod tests {
             )?;
 
             fs::remove_file(working_copy_path.join("src/tracked.txt"))?;
+            let missing_base_text = provider
+                .load_text(repository, &tracked_path, None)
+                .await?
+                .ok_or("missing BASE text for deleted working-copy file")?;
+            assert_eq!(missing_base_text, b"second\n");
             assert!(provider.status(repository).await?.iter().any(|status| {
                 status.path == tracked_path
                     && status.selection == SourceControlSelectionEligibility::RequiresDelete
