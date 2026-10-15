@@ -90,6 +90,25 @@ In long conversations, use the scroll arrow buttons at the bottom of the panel t
 
 When focus is in the message editor, you can also use {#kb agent::ScrollOutputPageUp}, {#kb agent::ScrollOutputPageDown}, {#kb agent::ScrollOutputToTop}, {#kb agent::ScrollOutputToBottom}, {#kb agent::ScrollOutputLineUp}, and {#kb agent::ScrollOutputLineDown} to navigate the thread, or {#kb agent::ScrollOutputToPreviousMessage} and {#kb agent::ScrollOutputToNextMessage} to jump between your prompts.
 
+### Compact Tool Calls {#compact-tool-calls}
+
+Enable `agent.compact_tool_calls` to group consecutive tool calls and thinking
+blocks into a collapsed summary between conversation messages:
+
+```json
+{
+  "agent": {
+    "compact_tool_calls": true
+  }
+}
+```
+
+Click a summary to show the individual entries in their original order. Running
+groups show an activity indicator. Permission requests, failed calls, and subagent
+cards remain visible individually. Search automatically opens a group containing
+the selected match. In compact mode, collapsed command cards show one line;
+click the command to reveal it. Commands awaiting approval are always shown in full.
+
 ### Thread titles {#thread-titles}
 
 Thread titles are auto-generated based on the content of the conversation.

@@ -107,6 +107,7 @@ const TOKEN_THRESHOLD: u64 = 250;
 
 pub(crate) const DRAFT_PROMPT_PERSIST_DEBOUNCE: Duration = Duration::from_millis(250);
 
+mod compact_tool_calls;
 pub(crate) mod elicitation;
 mod message_queue;
 mod thread_search_bar;
@@ -1594,15 +1595,8 @@ impl ConversationView {
                 let index = len - 1;
                 if let Some(active) = self.thread_view(&session_id) {
                     let entry_view_state = active.read(cx).entry_view_state.clone();
-                    let list_state = active.read(cx).list_state.clone();
                     entry_view_state.update(cx, |view_state, cx| {
                         view_state.sync_entry(index, thread, window, cx);
-                        list_state.splice_focusable(
-                            index..index,
-                            [view_state
-                                .entry(index)
-                                .and_then(|entry| entry.focus_handle(cx))],
-                        );
                     });
                     active.update(cx, |active, cx| {
                         active.sync_elicitation_state_for_entry(index, window, cx);
@@ -1614,25 +1608,25 @@ impl ConversationView {
             AcpThreadEvent::EntryUpdated(index) => {
                 if let Some(active) = self.thread_view(&session_id) {
                     let entry_view_state = active.read(cx).entry_view_state.clone();
-                    let list_state = active.read(cx).list_state.clone();
                     entry_view_state.update(cx, |view_state, cx| {
                         view_state.sync_entry(*index, thread, window, cx);
                     });
-                    list_state.remeasure_items(*index..*index + 1);
                     active.update(cx, |active, cx| {
                         active.sync_elicitation_state_for_entry(*index, window, cx);
                         active.auto_expand_streaming_thought(cx);
                         active.sync_generating_indicator(cx);
+                        let row = active.row_for_entry(*index);
+                        active.list_state.remeasure_items(row..row + 1);
                     });
                 }
             }
             AcpThreadEvent::EntriesRemoved(range) => {
                 if let Some(active) = self.thread_view(&session_id) {
                     let entry_view_state = active.read(cx).entry_view_state.clone();
-                    let list_state = active.read(cx).list_state.clone();
                     entry_view_state.update(cx, |view_state, _cx| view_state.remove(range.clone()));
-                    list_state.splice(range.clone(), 0);
                     active.update(cx, |active, cx| {
+                        active.activity_entries_removed(range);
+                        active.sync_generating_indicator(cx);
                         active.sync_editor_mode(cx);
                     });
                 }
@@ -6611,6 +6605,182 @@ pub(crate) mod tests {
                 .expect("No active thread")
                 .clone()
         })
+    }
+
+    #[gpui::test]
+    async fn test_compact_tool_calls_search_and_status_updates(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    compact_tool_calls: true,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+        });
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![
+            acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk::new(
+                "Thinking about the files".into(),
+            )),
+            acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new("compact-read", "Read papaya.txt")
+                    .kind(acp::ToolKind::Read)
+                    .status(acp::ToolCallStatus::Completed),
+            ),
+            acp::SessionUpdate::ToolCall(
+                acp::ToolCall::new("compact-command", "printf 'done'")
+                    .kind(acp::ToolKind::Execute)
+                    .status(acp::ToolCallStatus::Completed),
+            ),
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("Finished.".into())),
+        ]);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        let view = active_thread(&conversation_view, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Check files", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(thread.read(cx).entries().len(), 5);
+            assert_eq!(view.list_state.item_count(), 3);
+            assert_eq!(view.row_for_entry(1), 1);
+            assert_eq!(view.row_for_entry(3), 1);
+            assert_eq!(view.row_for_entry(4), 2);
+        });
+
+        view.update_in(cx, |view, window, cx| {
+            view.toggle_search(&crate::ToggleSearch, window, cx);
+        });
+        let bar = view
+            .read_with(cx, |view, _| view.thread_search_bar.clone())
+            .unwrap();
+        bar.update_in(cx, |bar, window, cx| {
+            bar.query_editor
+                .update(cx, |editor, cx| editor.set_text("papaya", window, cx));
+            bar.update_matches(window, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.list_state.item_count(), 5);
+            assert_eq!(view.list_state.logical_scroll_top().item_ix, 2);
+            assert!(
+                !view
+                    .entry_view_state
+                    .read(cx)
+                    .is_tool_call_expanded(&"compact-read".into())
+            );
+        });
+        add_to_workspace(conversation_view.clone(), cx);
+        cx.run_until_parked();
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                        "compact-command",
+                        acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::Failed),
+                    )),
+                    cx,
+                )
+                .expect("tool status update should succeed");
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.list_state.item_count(), 5);
+            assert_eq!(view.row_for_entry(3), 3);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_compact_tool_calls_settings_and_prompt_navigation(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let view = active_thread(&conversation_view, cx);
+        let thread = view.read_with(cx, |view, _| view.thread.clone());
+        for prompt in ["First question", "Second question"] {
+            connection.set_next_prompt_updates(vec![
+                acp::SessionUpdate::ToolCall(
+                    acp::ToolCall::new(prompt, "Read file")
+                        .kind(acp::ToolKind::Read)
+                        .status(acp::ToolCallStatus::Completed),
+                ),
+                acp::SessionUpdate::ToolCall(
+                    acp::ToolCall::new(format!("{prompt}-execute"), "Run command")
+                        .kind(acp::ToolKind::Execute)
+                        .status(acp::ToolCallStatus::Completed),
+                ),
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("Done".into())),
+            ]);
+            thread
+                .update(cx, |thread, cx| thread.send_raw(prompt, cx))
+                .await
+                .unwrap();
+            cx.run_until_parked();
+        }
+        cx.update(|_, cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    compact_tool_calls: true,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+        });
+        view.update(cx, |view, cx| {
+            view.sync_generating_indicator(cx);
+            assert_eq!(view.list_state.item_count(), 6);
+            view.scroll_to_user_message_index(None, cx);
+            assert_eq!(view.list_state.logical_scroll_top().item_ix, 3);
+        });
+        cx.update(|_, cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    compact_tool_calls: false,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+        });
+        view.update(cx, |view, cx| {
+            view.sync_generating_indicator(cx);
+            assert_thread_list_item_count_matches_entries(view, cx);
+            assert_eq!(view.list_state.logical_scroll_top().item_ix, 4);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_compact_tool_calls_keep_permission_requests_visible(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    compact_tool_calls: true,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+        });
+        let (_conversation, view, entry_ix, cx) =
+            setup_pending_permission_thread("compact-permission", cx).await;
+        view.read_with(cx, |view, cx| {
+            let entries = view.thread.read(cx).entries();
+            assert!(
+                matches!(entries.get(entry_ix), Some(AgentThreadEntry::ToolCall(call))
+                if matches!(call.status, ToolCallStatus::WaitingForConfirmation { .. }))
+            );
+            assert_eq!(
+                compact_tool_calls::ActivityKind::for_entry(&entries[entry_ix], cx),
+                None
+            );
+            assert_thread_list_item_count_matches_entries(view, cx);
+        });
     }
 
     fn assert_thread_list_item_count_matches_entries(view: &ThreadView, cx: &App) {
