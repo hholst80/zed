@@ -206,10 +206,15 @@ fn main() {
     // own arguments.
     sandbox::run_sandbox_launcher_if_invoked();
 
-    #[cfg(unix)]
-    util::prevent_root_execution();
-
     let args = Args::parse();
+
+    // Set custom data directory.
+    if let Some(dir) = &args.user_data_dir {
+        paths::set_custom_data_dir(dir);
+    }
+
+    #[cfg(unix)]
+    util::prevent_root_execution(paths::settings_file());
 
     // `zed --askpass` Makes zed operate in nc/netcat mode for use with askpass
     #[cfg(not(target_os = "windows"))]
@@ -266,11 +271,6 @@ fn main() {
     if args.dump_all_actions {
         dump_all_gpui_actions();
         return;
-    }
-
-    // Set custom data directory.
-    if let Some(dir) = &args.user_data_dir {
-        paths::set_custom_data_dir(dir);
     }
 
     #[cfg(target_os = "windows")]

@@ -141,6 +141,11 @@ pub enum ReduceMotionMode {
 #[with_fallible_options]
 #[derive(Debug, PartialEq, Default, Clone, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub struct SettingsContent {
+    /// Allow running Zed as root on Unix. Read only from user settings at startup.
+    /// Can also be enabled with the ZED_ALLOW_ROOT=true environment variable.
+    /// Default: false
+    pub allow_root: Option<bool>,
+
     #[serde(flatten)]
     pub project: ProjectSettingsContent,
 
