@@ -207,10 +207,20 @@ fn main() {
     // own arguments.
     sandbox::run_sandbox_launcher_if_invoked();
 
-    #[cfg(unix)]
-    util::prevent_root_execution();
-
     let args = Args::parse();
+
+    let restart_arguments = if let Some(directory) = args.user_data_dir.as_deref() {
+        let directory = paths::set_custom_data_dir(directory);
+        vec![
+            std::ffi::OsString::from("--user-data-dir"),
+            directory.as_os_str().to_owned(),
+        ]
+    } else {
+        Vec::new()
+    };
+
+    #[cfg(unix)]
+    util::prevent_root_execution(paths::settings_file());
 
     // `zed --askpass` Makes zed operate in nc/netcat mode for use with askpass
     #[cfg(not(target_os = "windows"))]
@@ -258,16 +268,6 @@ fn main() {
         dump_all_gpui_actions();
         return;
     }
-
-    let restart_arguments = if let Some(directory) = args.user_data_dir.as_deref() {
-        let directory = paths::set_custom_data_dir(directory);
-        vec![
-            std::ffi::OsString::from("--user-data-dir"),
-            directory.as_os_str().to_owned(),
-        ]
-    } else {
-        Vec::new()
-    };
 
     #[cfg(target_os = "windows")]
     match util::get_zed_cli_path() {
