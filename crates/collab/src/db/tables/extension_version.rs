@@ -24,6 +24,7 @@ pub struct Model {
     pub provides_grammars: bool,
     pub provides_language_servers: bool,
     pub provides_context_servers: bool,
+    pub provides_source_control_providers: bool,
     pub provides_agent_servers: bool,
     pub provides_slash_commands: bool,
     pub provides_indexed_docs_providers: bool,
@@ -56,6 +57,10 @@ impl Model {
 
         if self.provides_context_servers {
             provides.insert(ExtensionProvides::ContextServers);
+        }
+
+        if self.provides_source_control_providers {
+            provides.insert(ExtensionProvides::SourceControlProviders);
         }
 
         if self.provides_agent_servers {

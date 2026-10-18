@@ -5991,6 +5991,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "source_control",
  "task",
  "tempfile",
  "toml 0.9.8",
@@ -6070,6 +6071,7 @@ dependencies = [
  "serde_json",
  "serde_json_lenient",
  "settings",
+ "source_control",
  "task",
  "telemetry",
  "tempfile",
@@ -6083,6 +6085,7 @@ dependencies = [
  "wasmparser 0.254.2",
  "wasmtime",
  "wasmtime-wasi",
+ "zeroize",
  "zlog",
  "ztracing",
 ]
@@ -7085,6 +7088,7 @@ dependencies = [
  "serde_json",
  "settings",
  "smallvec",
+ "source_control",
  "strum 0.28.0",
  "sysinfo 0.39.6",
  "task",
@@ -13936,6 +13940,7 @@ dependencies = [
  "smol",
  "snippet",
  "snippet_provider",
+ "source_control",
  "sum_tree",
  "task",
  "tempfile",
@@ -14432,6 +14437,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
 dependencies = [
  "memchr",
+ "serde",
 ]
 
 [[package]]
@@ -16915,6 +16921,17 @@ checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
  "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "source_control"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures 0.3.34",
+ "serde",
+ "thiserror 2.0.17",
+ "zeroize",
 ]
 
 [[package]]
@@ -22778,6 +22795,22 @@ name = "zed_proto"
 version = "0.3.4"
 dependencies = [
  "zed_extension_api 0.7.0",
+]
+
+[[package]]
+name = "zed_svn"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures 0.3.34",
+ "quick-xml 0.41.0",
+ "semver",
+ "serde",
+ "source_control",
+ "tempfile",
+ "thiserror 2.0.17",
+ "zed_extension_api 0.8.0",
+ "zeroize",
 ]
 
 [[package]]
