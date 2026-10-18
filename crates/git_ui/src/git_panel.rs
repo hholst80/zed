@@ -108,6 +108,7 @@ use workspace::SERIALIZATION_THROTTLE_TIME;
 use workspace::{
     Item, ModalView, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
+    item::PreviewTabsSettings,
     notifications::{DetachAndPromptErr, NotificationId, NotifyTaskExt},
 };
 use zed_actions::{
@@ -9008,6 +9009,78 @@ impl GitPanel {
         .detach();
     }
 
+    fn source_control_file_path(
+        &self,
+        key: &SourceControlRepositoryKey,
+        status: &SourceControlStatusEntry,
+        cx: &App,
+    ) -> anyhow::Result<Option<ProjectPath>> {
+        if status.node_kind == source_control::SourceControlNodeKind::Directory
+            || matches!(
+                status.content_status,
+                SourceControlContentStatus::Missing | SourceControlContentStatus::Deleted
+            )
+        {
+            return Ok(None);
+        }
+
+        let (_, _, project_path) =
+            self.resolve_source_control_project_path(key, &status.path, cx)?;
+        let entry = self
+            .project
+            .read(cx)
+            .entry_for_path(&project_path, cx)
+            .with_context(|| {
+                format!(
+                    "{} is no longer available in the project",
+                    status.path.as_str()
+                )
+            })?;
+        Ok(entry.is_file().then_some(project_path))
+    }
+
+    fn open_source_control_file(
+        &mut self,
+        key: &SourceControlRepositoryKey,
+        status: &SourceControlStatusEntry,
+        click_count: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let project_path = match self.source_control_file_path(key, status, cx) {
+            Ok(Some(path)) => path,
+            Ok(None) => return,
+            Err(error) => {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.show_error(format!("Opening source-control file failed: {error}"), cx)
+                });
+                return;
+            }
+        };
+        let focus_item = click_count > 1;
+        let allow_preview =
+            !focus_item && PreviewTabsSettings::get_global(cx).enable_preview_from_project_panel;
+        if !focus_item {
+            self.focus_handle.focus(window, cx);
+        }
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.open_path_preview(
+                    project_path,
+                    None,
+                    focus_item,
+                    allow_preview,
+                    true,
+                    window,
+                    cx,
+                )
+            })
+            .detach_and_notify_err(workspace.downgrade(), window, cx);
+    }
+
     fn show_source_control_diff(
         &mut self,
         key: SourceControlRepositoryKey,
@@ -9367,6 +9440,9 @@ impl GitPanel {
         capabilities: SourceControlCapabilities,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let can_open_file = !matches!(self.source_control_file_path(key, &status, cx), Ok(None));
+        let open_key = key.clone();
+        let open_status = status.clone();
         let selected = self.source_control_path_selected(key, &status);
         let selectable = matches!(
             status.selection,
@@ -9456,9 +9532,34 @@ impl GitPanel {
                     .color(source_control_status_color(&status)),
             )
             .child(
-                Label::new(status.path.as_str().to_owned())
-                    .size(LabelSize::Small)
-                    .truncate(),
+                div()
+                    .id(SharedString::from(format!(
+                        "source-control-file-{}",
+                        status.path.as_str()
+                    )))
+                    .debug_selector(|| format!("source-control-file-{}", status.path.as_str()))
+                    .min_w_0()
+                    .child(
+                        Label::new(status.path.as_str().to_owned())
+                            .size(LabelSize::Small)
+                            .truncate(),
+                    )
+                    .when(can_open_file, |this| {
+                        this.cursor_pointer()
+                            .hover(|style| style.bg(cx.theme().colors().element_hover))
+                            .tooltip(Tooltip::text(
+                                "Click to open; double-click to keep open and focus",
+                            ))
+                            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                                this.open_source_control_file(
+                                    &open_key,
+                                    &open_status,
+                                    event.click_count(),
+                                    window,
+                                    cx,
+                                );
+                            }))
+                    }),
             )
             .when_some(metadata, |this, metadata| {
                 this.child(
@@ -10941,6 +11042,288 @@ mod tests {
         await_git_panel_entries(&panel, &mut cx).await;
 
         (fs, project, workspace, panel, cx)
+    }
+
+    #[gpui::test]
+    async fn test_source_control_file_preview(cx: &mut TestAppContext) {
+        async {
+            init_test(cx);
+            let (_, project, workspace, panel, mut cx) = setup_git_panel_with_changes(
+                cx,
+                json!({
+                    ".git": {},
+                    "first.txt": "first",
+                    "second.txt": "second",
+                    "third.txt": "third",
+                }),
+                &[
+                    ("first.txt", StatusCode::Modified),
+                    ("second.txt", StatusCode::Modified),
+                ],
+            )
+            .await;
+            let snapshot = cx
+                .read(|cx| {
+                    project
+                        .read(cx)
+                        .source_control_store()
+                        .read(cx)
+                        .repositories()
+                        .next()
+                        .cloned()
+                })
+                .context("repository should be available")?;
+            workspace.update_in(&mut cx, |workspace, window, cx| {
+                workspace.add_panel(panel.clone(), window, cx);
+                workspace.open_panel::<GitPanel>(window, cx);
+            });
+            let key = &snapshot.repository.key;
+            let mut status = snapshot
+                .statuses
+                .first()
+                .cloned()
+                .context("status should be available")?;
+            status.node_kind = source_control::SourceControlNodeKind::Unknown;
+            status.content_status = SourceControlContentStatus::Unversioned;
+            status.selection = SourceControlSelectionEligibility::RequiresAdd;
+
+            for path in ["first.txt", "second.txt"] {
+                status.path = SourceControlPath::new(path)?;
+                panel.update_in(&mut cx, |panel, window, cx| {
+                    panel.open_source_control_file(key, &status, 1, window, cx);
+                    assert!(!panel.source_control_path_selected(key, &status));
+                });
+                cx.run_until_parked();
+                workspace.update_in(&mut cx, |workspace, window, cx| {
+                    let pane = workspace.active_pane().read(cx);
+                    assert_eq!(pane.items_len(), 1);
+                    assert!(pane.preview_item().is_some());
+                    assert_eq!(
+                        pane.active_item()
+                            .and_then(|item| item.project_path(cx))
+                            .map(|path| path.path),
+                        Some(rel_path(path).into())
+                    );
+                    assert!(panel.read(cx).focus_handle.is_focused(window));
+                });
+            }
+
+            panel.update_in(&mut cx, |panel, window, cx| {
+                panel.open_source_control_file(key, &status, 2, window, cx);
+            });
+            cx.run_until_parked();
+            workspace.update_in(&mut cx, |workspace, window, cx| {
+                let pane = workspace.active_pane().read(cx);
+                assert_eq!(pane.items_len(), 1);
+                assert!(pane.preview_item().is_none());
+                assert!(
+                    pane.active_item().is_some_and(|item| item
+                        .item_focus_handle(cx)
+                        .contains_focused(window, cx))
+                );
+            });
+
+            for (disable_global, path, expected_count) in
+                [(false, "first.txt", 2), (true, "third.txt", 3)]
+            {
+                cx.update(|_, cx| {
+                    SettingsStore::update_global(cx, |store, cx| {
+                        store.update_user_settings(cx, |settings| {
+                            let preview = settings.preview_tabs.get_or_insert_default();
+                            preview.enabled = Some(!disable_global);
+                            preview.enable_preview_from_project_panel = Some(disable_global);
+                        });
+                    });
+                });
+                status.path = SourceControlPath::new(path)?;
+                panel.update_in(&mut cx, |panel, window, cx| {
+                    panel.open_source_control_file(key, &status, 1, window, cx);
+                });
+                cx.run_until_parked();
+                workspace.read_with(&cx, |workspace, cx| {
+                    let pane = workspace.active_pane().read(cx);
+                    assert_eq!(pane.items_len(), expected_count);
+                    assert!(pane.preview_item().is_none());
+                });
+            }
+            anyhow::Ok(())
+        }
+        .await
+        .expect("source-control file test failed");
+    }
+
+    #[gpui::test]
+    async fn test_source_control_file_click_target(cx: &mut TestAppContext) {
+        async {
+            init_test(cx);
+            let (_, project, workspace, panel, mut cx) = setup_git_panel_with_changes(
+                cx,
+                json!({ ".git": {}, "file.txt": "contents" }),
+                &[("file.txt", StatusCode::Modified)],
+            )
+            .await;
+            let snapshot = cx
+                .read(|cx| {
+                    project
+                        .read(cx)
+                        .source_control_store()
+                        .read(cx)
+                        .repositories()
+                        .next()
+                        .cloned()
+                })
+                .context("repository should be available")?;
+            let key = &snapshot.repository.key;
+            let mut status = snapshot
+                .statuses
+                .first()
+                .cloned()
+                .context("status should be available")?;
+            status.selection = SourceControlSelectionEligibility::IncludedByDefault;
+            struct StatusRow {
+                panel: Entity<GitPanel>,
+                workspace: Entity<MultiWorkspace>,
+                key: SourceControlRepositoryKey,
+                status: SourceControlStatusEntry,
+                can_write: bool,
+            }
+            impl Render for StatusRow {
+                fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                    let row = self.panel.update(cx, |panel, cx| {
+                        panel.render_source_control_status(
+                            &self.key,
+                            self.status.clone(),
+                            self.can_write,
+                            SourceControlCapabilities {
+                                commit: true,
+                                ..SourceControlCapabilities::NONE
+                            },
+                            cx,
+                        )
+                    });
+                    v_flex()
+                        .size_full()
+                        .child(row)
+                        .child(self.workspace.clone())
+                }
+            }
+            let root = cx
+                .update(|window, _| window.root::<MultiWorkspace>().flatten())
+                .context("workspace root should be available")?;
+            let row = cx.replace_root_view(|_, _| StatusRow {
+                panel: panel.clone(),
+                workspace: root,
+                key: key.clone(),
+                status: status.clone(),
+                can_write: true,
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let bounds = cx
+                .debug_bounds("source-control-file-file.txt")
+                .context("filename should be rendered")?;
+            cx.simulate_click(
+                gpui::point(px(16.), bounds.center().y),
+                gpui::Modifiers::none(),
+            );
+            panel.read_with(&cx, |panel, _| {
+                assert!(!panel.source_control_path_selected(key, &status))
+            });
+            workspace.read_with(&cx, |workspace, cx| {
+                assert_eq!(workspace.active_pane().read(cx).items_len(), 0)
+            });
+
+            row.update(&mut cx, |row, cx| {
+                row.can_write = false;
+                cx.notify();
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let bounds = cx
+                .debug_bounds("source-control-file-file.txt")
+                .context("filename should be rendered")?;
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+            assert_editor_opened_with_path(&workspace, Path::new("file.txt"), &mut cx);
+            panel.read_with(&cx, |panel, _| {
+                assert!(!panel.source_control_path_selected(key, &status))
+            });
+            anyhow::Ok(())
+        }
+        .await
+        .expect("source-control file test failed");
+    }
+
+    #[gpui::test]
+    async fn test_source_control_file_eligibility(cx: &mut TestAppContext) {
+        async {
+            init_test(cx);
+            let (_, project, workspace, panel, mut cx) = setup_git_panel_with_changes(
+                cx,
+                json!({
+                    ".git": {},
+                    "src": { "file.txt": "contents" },
+                }),
+                &[("src/file.txt", StatusCode::Modified)],
+            )
+            .await;
+            let snapshot = cx
+                .read(|cx| {
+                    project
+                        .read(cx)
+                        .source_control_store()
+                        .read(cx)
+                        .repositories()
+                        .next()
+                        .cloned()
+                })
+                .context("repository should be available")?;
+            let key = &snapshot.repository.key;
+            let mut status = snapshot
+                .statuses
+                .first()
+                .cloned()
+                .context("status should be available")?;
+            status.node_kind = source_control::SourceControlNodeKind::Unknown;
+            panel.read_with(&cx, |panel, cx| -> anyhow::Result<()> {
+                let project_path = panel
+                    .source_control_file_path(key, &status, cx)?
+                    .context("file should be openable")?;
+                assert_eq!(project_path.path.as_ref(), rel_path("src/file.txt"));
+                Ok(())
+            })?;
+
+            for content_status in [
+                SourceControlContentStatus::Missing,
+                SourceControlContentStatus::Deleted,
+            ] {
+                status.content_status = content_status;
+                panel.update_in(&mut cx, |panel, window, cx| {
+                    panel.open_source_control_file(key, &status, 1, window, cx);
+                });
+            }
+            status.content_status = SourceControlContentStatus::Unversioned;
+            status.path = SourceControlPath::new("src")?;
+            panel.update_in(&mut cx, |panel, window, cx| {
+                panel.open_source_control_file(key, &status, 1, window, cx);
+            });
+            cx.run_until_parked();
+            workspace.read_with(&cx, |workspace, cx| {
+                assert_eq!(workspace.active_pane().read(cx).items_len(), 0);
+                assert!(workspace.notification_ids().is_empty());
+            });
+
+            status.path = SourceControlPath::new("unavailable.txt")?;
+            panel.update_in(&mut cx, |panel, window, cx| {
+                panel.open_source_control_file(key, &status, 1, window, cx);
+            });
+            cx.run_until_parked();
+            workspace.read_with(&cx, |workspace, cx| {
+                assert_eq!(workspace.active_pane().read(cx).items_len(), 0);
+                assert!(!workspace.notification_ids().is_empty());
+            });
+            anyhow::Ok(())
+        }
+        .await
+        .expect("source-control file test failed");
     }
 
     #[gpui::test]
