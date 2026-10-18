@@ -219,26 +219,73 @@ where
     }
 }
 
-/// Prevents execution of the application with root privileges on Unix systems.
-///
-/// This function checks if the current process is running with root privileges
-/// and terminates the program with an error message unless explicitly allowed via the
-/// `ZED_ALLOW_ROOT` environment variable.
+/// Prevents root execution unless explicitly allowed by the environment or user settings.
 #[cfg(unix)]
-pub fn prevent_root_execution() {
-    let is_root = nix::unistd::geteuid().is_root();
-    let allow_root = std::env::var("ZED_ALLOW_ROOT").is_ok_and(|val| val == "true");
+pub fn prevent_root_execution(settings_path: &std::path::Path) {
+    if !nix::unistd::geteuid().is_root()
+        || std::env::var("ZED_ALLOW_ROOT").is_ok_and(|value| value == "true")
+    {
+        return;
+    }
 
-    if is_root && !allow_root {
-        eprintln!(
-            "\
+    match root_execution_allowed_by_settings(settings_path) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => eprintln!("Error reading {}: {error:#}", settings_path.display()),
+    }
+
+    eprintln!(
+        "\
 Error: Running Zed as root or via sudo is unsupported.
        Doing so (even once) may subtly break things for all subsequent non-root usage of Zed.
-       It is untested and not recommended, don't complain when things break.
-       If you wish to proceed anyways, set `ZED_ALLOW_ROOT=true` in your environment."
-        );
-        std::process::exit(1);
+       To proceed, set `ZED_ALLOW_ROOT=true` in your environment or
+       set `\"allow_root\": true` in {}.",
+        settings_path.display()
+    );
+    std::process::exit(1);
+}
+
+#[cfg(unix)]
+fn root_execution_allowed_by_settings(settings_path: &std::path::Path) -> Result<bool> {
+    // Startup runs before the settings store exists; only trust the user settings file.
+    #[derive(::serde::Deserialize)]
+    struct StartupSettings {
+        #[serde(default)]
+        allow_root: bool,
     }
+
+    let content = match std::fs::read_to_string(settings_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let settings: StartupSettings = serde_json_lenient::from_str(&content)?;
+    Ok(settings.allow_root)
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn test_root_execution_settings() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let settings_path = directory.path().join("settings.json");
+    assert!(!root_execution_allowed_by_settings(&settings_path)?);
+    for (content, expected) in [
+        ("{}", false),
+        (r#"{"allow_root": false}"#, false),
+        ("{ // Allow root locally\n \"allow_root\": true, }", true),
+        (r#"{"unrelated_setting": true}"#, false),
+    ] {
+        std::fs::write(&settings_path, content)?;
+        assert_eq!(
+            root_execution_allowed_by_settings(&settings_path)?,
+            expected
+        );
+    }
+    for content in [r#"{"allow_root": "true"}"#, "{"] {
+        std::fs::write(&settings_path, content)?;
+        assert!(root_execution_allowed_by_settings(&settings_path).is_err());
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
