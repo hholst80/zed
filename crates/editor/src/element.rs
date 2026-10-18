@@ -13,8 +13,8 @@ use crate::{
     EditDisplayMode, EditPrediction, Editor, EditorMode, EditorSettings, EditorSnapshot,
     EditorStyle, FILE_HEADER_HEIGHT, FocusedBlock, GutterDimensions, HalfPageDown, HalfPageUp,
     HandleInput, HoveredCursor, InlayHintRefreshReason, LineDown, LineHighlight, LineUp,
-    MAX_LINE_LEN, MINIMAP_FONT_SIZE, PageDown, PageUp, Point, RowExt, RowRangeExt, Selection,
-    SelectionDragState, SizingBehavior, SoftWrap, ToPoint,
+    MAX_LINE_LEN, MINIMAP_FONT_SIZE, PageDown, PageUp, Point, RevisionBlameEntry, RowExt,
+    RowRangeExt, Selection, SelectionDragState, SizingBehavior, SoftWrap, ToPoint,
     code_context_menus::{CodeActionsMenu, MENU_ASIDE_MAX_WIDTH, MENU_ASIDE_MIN_WIDTH, MENU_GAP},
     column_pixels,
     display_map::{
@@ -77,6 +77,7 @@ use std::{
     cell::Cell,
     cmp::{self, Ordering},
     fmt::{self, Write},
+    hash::{DefaultHasher, Hash, Hasher},
     iter, mem,
     ops::{Deref, Range},
     rc::Rc,
@@ -2209,6 +2210,43 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<Vec<AnyElement>> {
+        if self
+            .editor
+            .update(cx, |editor, cx| editor.render_revision_blame_gutter(cx))
+        {
+            let blame = self.editor.read(cx).revision_blame.clone()?;
+            let blamed_rows = blame.update(cx, |blame, cx| {
+                blame.entries_for_rows(buffer_rows, cx).collect::<Vec<_>>()
+            });
+            let width = max_width.map_or(AvailableSpace::MaxContent, AvailableSpace::Definite);
+            let start_x = em_width;
+            let mut last_used_color: Option<(Hsla, SharedString)> = None;
+            let shaped_lines = blamed_rows
+                .into_iter()
+                .enumerate()
+                .flat_map(|(ix, blame_entry)| {
+                    let mut element = render_revision_blame_entry(
+                        ix,
+                        blame_entry?,
+                        &self.style,
+                        &mut last_used_color,
+                        cx,
+                    );
+                    let start_y = line_height
+                        * (DisplayRow(start_row.0 + ix as u32).as_f64() - scroll_position.y) as f32;
+                    let absolute_offset = gutter_hitbox.origin + point(start_x, start_y);
+                    element.prepaint_as_root(
+                        absolute_offset,
+                        size(width, AvailableSpace::MinContent),
+                        window,
+                        cx,
+                    );
+                    Some(element)
+                })
+                .collect();
+            return Some(shaped_lines);
+        }
+
         if !self
             .editor
             .update(cx, |editor, cx| editor.render_git_blame_gutter(cx))
@@ -6988,6 +7026,81 @@ fn render_blame_entry_popover(
         window,
         cx,
     )
+}
+
+fn render_revision_blame_entry(
+    ix: usize,
+    entry: RevisionBlameEntry,
+    style: &EditorStyle,
+    last_used_color: &mut Option<(Hsla, SharedString)>,
+    cx: &mut App,
+) -> AnyElement {
+    const MAX_AUTHOR_LENGTH: usize = 20;
+    const MAX_REVISION_LENGTH: usize = 12;
+
+    let revision_id = entry
+        .revision_id
+        .clone()
+        .or_else(|| entry.revision_label.clone())
+        .unwrap_or_else(|| "unknown".into());
+    let mut hasher = DefaultHasher::new();
+    revision_id.hash(&mut hasher);
+    let color_index = hasher.finish() as u32;
+    let mut revision_color = cx
+        .theme()
+        .players()
+        .color_for_participant(color_index)
+        .cursor;
+    if let Some((last_color, last_revision)) = last_used_color.as_ref()
+        && *last_revision != revision_id
+        && *last_color == revision_color
+    {
+        revision_color = cx
+            .theme()
+            .players()
+            .color_for_participant(color_index.wrapping_add(1))
+            .cursor;
+    }
+    *last_used_color = Some((revision_color, revision_id));
+
+    let revision = entry.revision_label.as_deref().unwrap_or("-");
+    let revision = util::truncate_and_trailoff(revision, MAX_REVISION_LENGTH);
+    let author = entry.author.as_deref().unwrap_or("<no name>");
+    let author = util::truncate_and_trailoff(author, MAX_AUTHOR_LENGTH);
+    let timestamp = entry
+        .timestamp
+        .as_deref()
+        .map(|timestamp| timestamp.chars().take(10).collect::<String>())
+        .unwrap_or_default();
+    let tooltip = format!(
+        "Revision {}\nAuthor: {}\nDate: {}",
+        entry.revision_label.as_deref().unwrap_or("unknown"),
+        entry.author.as_deref().unwrap_or("unknown"),
+        entry.timestamp.as_deref().unwrap_or("unknown")
+    );
+
+    div()
+        .mr_2()
+        .child(
+            h_flex()
+                .id(("revision-blame", ix))
+                .w_full()
+                .gap_2()
+                .justify_between()
+                .font(style.text.font())
+                .line_height(style.text.line_height)
+                .text_color(cx.theme().status().hint)
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(div().text_color(revision_color).child(revision))
+                        .child(author),
+                )
+                .child(timestamp)
+                .hover(|style| style.bg(cx.theme().colors().element_hover))
+                .tooltip(Tooltip::text(tooltip)),
+        )
+        .into_any_element()
 }
 
 fn render_blame_entry(

@@ -55,6 +55,7 @@ serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true
 smallvec.workspace = true
+source_control.workspace = true
 strum.workspace = true
 sysinfo.workspace = true
 task.workspace = true

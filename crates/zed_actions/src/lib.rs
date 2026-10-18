@@ -985,3 +985,25 @@ pub mod git_panel {
         ]
     );
 }
+
+pub mod source_control {
+    use gpui::actions;
+
+    actions!(
+        source_control,
+        [
+            /// Toggles focus on the source control panel.
+            ToggleFocus,
+            /// Opens the source control repository selector.
+            SelectRepository,
+            /// Refreshes the active source control provider.
+            Refresh,
+            /// Updates the active source control working copy.
+            Update,
+            /// Switches the active source control working copy to a URL.
+            Switch,
+            /// Checks out a source control URL into a selected directory.
+            Checkout,
+        ]
+    );
+}

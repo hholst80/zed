@@ -7,6 +7,7 @@ use gpui::{App, Global, ReadGlobal, SharedString, Task};
 use language::{BinaryStatus, LanguageMatcher, LanguageName, LoadedLanguage};
 use lsp::LanguageServerName;
 use parking_lot::RwLock;
+use source_control::SourceControlProviderId;
 
 use crate::Extension;
 
@@ -32,6 +33,7 @@ pub struct ExtensionHostProxy {
     context_server_proxy: RwLock<Option<Arc<dyn ExtensionContextServerProxy>>>,
     debug_adapter_provider_proxy: RwLock<Option<Arc<dyn ExtensionDebugAdapterProviderProxy>>>,
     language_model_provider_proxy: RwLock<Option<Arc<dyn ExtensionLanguageModelProviderProxy>>>,
+    source_control_provider_proxy: RwLock<Option<Arc<dyn ExtensionSourceControlProviderProxy>>>,
 }
 
 impl ExtensionHostProxy {
@@ -57,6 +59,7 @@ impl ExtensionHostProxy {
             context_server_proxy: RwLock::default(),
             debug_adapter_provider_proxy: RwLock::default(),
             language_model_provider_proxy: RwLock::default(),
+            source_control_provider_proxy: RwLock::default(),
         }
     }
 
@@ -97,6 +100,61 @@ impl ExtensionHostProxy {
         self.language_model_provider_proxy
             .write()
             .replace(Arc::new(proxy));
+    }
+
+    pub fn register_source_control_provider_proxy(
+        &self,
+        proxy: impl ExtensionSourceControlProviderProxy,
+    ) {
+        self.source_control_provider_proxy
+            .write()
+            .replace(Arc::new(proxy));
+    }
+}
+
+pub trait ExtensionSourceControlProviderProxy: Send + Sync + 'static {
+    fn register_source_control_provider(
+        &self,
+        extension: Arc<dyn Extension>,
+        provider_id: SourceControlProviderId,
+        display_name: Arc<str>,
+        cx: &mut App,
+    );
+
+    fn unregister_source_control_provider(
+        &self,
+        extension_id: &Arc<str>,
+        provider_id: &SourceControlProviderId,
+        cx: &mut App,
+    );
+}
+
+impl ExtensionSourceControlProviderProxy for ExtensionHostProxy {
+    fn register_source_control_provider(
+        &self,
+        extension: Arc<dyn Extension>,
+        provider_id: SourceControlProviderId,
+        display_name: Arc<str>,
+        cx: &mut App,
+    ) {
+        let Some(proxy) = self.source_control_provider_proxy.read().clone() else {
+            return;
+        };
+
+        proxy.register_source_control_provider(extension, provider_id, display_name, cx)
+    }
+
+    fn unregister_source_control_provider(
+        &self,
+        extension_id: &Arc<str>,
+        provider_id: &SourceControlProviderId,
+        cx: &mut App,
+    ) {
+        let Some(proxy) = self.source_control_provider_proxy.read().clone() else {
+            return;
+        };
+
+        proxy.unregister_source_control_provider(extension_id, provider_id, cx)
     }
 }
 

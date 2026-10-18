@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: script/build-zed-container [MODE] [OPTIONS]
+
+Build Zed and the Subversion extension in a reproducible container. The
+repository is bind-mounted at /workspace/zed, so artifacts are written to the
+host under target/container.
+
+Modes:
+  build             Build Zed, its CLI, and the SVN extension (default)
+  test              Run the source-control and SVN test suites
+  bundle            Build Zed's release Linux archive
+  install           Build and unpack a bundled local Zed application
+  shell             Open an interactive shell in the build container
+  image              Build only the container image
+
+Options:
+  --release         Use Cargo's release profile for build or test
+  --engine ENGINE   Select docker or podman
+  --no-image-build  Reuse an existing image
+  -h, --help        Show this help
+
+Environment:
+  CONTAINER_ENGINE       Default container engine
+  ZED_BUILD_IMAGE        Image tag (default: zed-subversion-build:local)
+  ZED_BUILD_BASE_IMAGE   Base image (default: ubuntu:24.04)
+  ZED_BUILD_JOBS         Cargo jobs for bundle/install (default: 1)
+EOF
+}
+
+mode=build
+mode_was_set=false
+release=false
+build_image=true
+engine="${CONTAINER_ENGINE:-}"
+image="${ZED_BUILD_IMAGE:-zed-subversion-build:local}"
+base_image="${ZED_BUILD_BASE_IMAGE:-ubuntu:24.04}"
+bundle_jobs="${ZED_BUILD_JOBS:-1}"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        build|test|bundle|install|shell|image)
+            if [[ "${mode_was_set}" == true ]]; then
+                echo "Only one mode can be selected" >&2
+                usage >&2
+                exit 2
+            fi
+            mode="$1"
+            mode_was_set=true
+            shift
+            ;;
+        --release)
+            release=true
+            shift
+            ;;
+        --engine)
+            if [[ $# -lt 2 ]]; then
+                echo "--engine requires docker or podman" >&2
+                exit 2
+            fi
+            engine="$2"
+            shift 2
+            ;;
+        --no-image-build)
+            build_image=false
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
+if [[ -z "${engine}" ]]; then
+    if type -p docker >/dev/null 2>&1; then
+        engine=docker
+    elif type -p podman >/dev/null 2>&1; then
+        engine=podman
+    else
+        echo "Neither docker nor podman is available" >&2
+        exit 1
+    fi
+fi
+
+if [[ "${engine}" != docker && "${engine}" != podman ]]; then
+    echo "Unsupported container engine: ${engine}" >&2
+    exit 2
+fi
+
+if [[ "${mode}" == bundle || "${mode}" == install ]]; then
+    if [[ ! "${bundle_jobs}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ZED_BUILD_JOBS must be a positive integer" >&2
+        exit 2
+    fi
+fi
+if ! type -p "${engine}" >/dev/null 2>&1; then
+    echo "Container engine is not available: ${engine}" >&2
+    exit 1
+fi
+
+script_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repository_root="$(cd -- "${script_directory}/.." && pwd)"
+host_uid="$(id -u)"
+host_gid="$(id -g)"
+image_uid="${host_uid}"
+image_gid="${host_gid}"
+if [[ "${host_uid}" == 0 ]]; then
+    # UID 0 already exists in the base image. Keep the image's development
+    # user unprivileged, but run builds as root so bind-mounted artifacts retain
+    # the invoking host user's ownership.
+    image_uid=1000
+    image_gid=1000
+fi
+cache_suffix="${host_uid}-${host_gid}"
+
+if [[ "${build_image}" == true ]]; then
+    "${engine}" build \
+        --file "${repository_root}/Dockerfile-build" \
+        --target development \
+        --tag "${image}" \
+        --build-arg "BASE_IMAGE=${base_image}" \
+        --build-arg "USER_UID=${image_uid}" \
+        --build-arg "USER_GID=${image_gid}" \
+        "${repository_root}"
+fi
+
+if [[ "${mode}" == image ]]; then
+    exit 0
+fi
+
+profile=debug
+cargo_profile_flag=""
+if [[ "${release}" == true ]]; then
+    profile=release
+    cargo_profile_flag="--release"
+fi
+
+case "${mode}" in
+    build)
+        container_command="cargo build --locked ${cargo_profile_flag} -p zed -p cli && cargo build --locked ${cargo_profile_flag} -p zed_svn --target wasm32-wasip2"
+        ;;
+    test)
+        container_command="cargo test --locked ${cargo_profile_flag} -p source_control -p zed_svn"
+        ;;
+    bundle)
+        container_command="export CARGO_BUILD_JOBS=${bundle_jobs}; ./script/bundle-linux && cargo build --locked --release -p zed_svn --target wasm32-wasip2"
+        profile=release
+        ;;
+    install)
+        # Zed's canonical thin-LTO release profile can exceed 11 GiB even with
+        # one Cargo job. A local development install keeps release optimization
+        # while using the workspace's memory-friendlier codegen shape.
+        container_command="export CARGO_BUILD_JOBS=${bundle_jobs} CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 CARGO_PROFILE_RELEASE_DEBUG=0; ./script/bundle-linux --skip-remote-server && cargo build --locked --release -p zed_svn --target wasm32-wasip2"
+        profile=release
+        ;;
+    shell)
+        container_command=""
+        ;;
+esac
+
+run_arguments=(
+    run
+    --rm
+    --init
+    --hostname zed-build
+    --workdir /workspace/zed
+    --mount "type=bind,source=${repository_root},target=/workspace/zed"
+    --mount "type=volume,source=zed-build-cargo-registry-${cache_suffix},target=/home/zed/.cargo/registry"
+    --mount "type=volume,source=zed-build-cargo-git-${cache_suffix},target=/home/zed/.cargo/git"
+)
+
+if [[ "${host_uid}" == 0 ]]; then
+    run_arguments+=(--user 0:0)
+fi
+
+if [[ "${mode}" == shell ]]; then
+    if [[ -t 0 && -t 1 ]]; then
+        run_arguments+=(-it)
+    else
+        run_arguments+=(-i)
+    fi
+    "${engine}" "${run_arguments[@]}" "${image}" /bin/bash
+else
+    "${engine}" "${run_arguments[@]}" "${image}" /bin/bash -lc "${container_command}"
+fi
+
+if [[ "${mode}" == install ]]; then
+    "${repository_root}/script/install-zed-local"
+elif [[ "${mode}" == build ]]; then
+    echo "Zed artifact: ${repository_root}/target/container/${profile}/zed"
+    echo "CLI artifact: ${repository_root}/target/container/${profile}/cli"
+    echo "SVN extension: ${repository_root}/target/container/wasm32-wasip2/${profile}/zed_svn.wasm"
+elif [[ "${mode}" == bundle ]]; then
+    echo "Linux bundle directory: ${repository_root}/target/container/release"
+    echo "SVN extension: ${repository_root}/target/container/wasm32-wasip2/release/zed_svn.wasm"
+fi

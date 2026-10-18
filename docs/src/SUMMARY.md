@@ -27,6 +27,7 @@
   - [Debugger](./debugger.md)
   - [REPL](./repl.md)
 - [Git](./git.md)
+- [Subversion](./subversion.md)
 - [Modelines](./modelines.md)
 
 # Collaboration
@@ -196,6 +197,7 @@
   - [License Requirements](./extensions/publishing/license-requirements.md)
   - [Publishing Guide](./extensions/publishing/publishing-guide.md)
 - [Extension Capabilities](./extensions/capabilities.md)
+- [Source Control Provider Extensions](./extensions/source-control-providers.md)
 - [Language Extensions](./extensions/languages.md)
 - [Debugger Extensions](./extensions/debugger-extensions.md)
 - [Theme Extensions](./extensions/themes.md)

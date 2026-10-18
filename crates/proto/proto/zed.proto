@@ -13,6 +13,7 @@ import "git.proto";
 import "image.proto";
 import "lsp.proto";
 import "notification.proto";
+import "source_control.proto";
 import "task.proto";
 import "toolchain.proto";
 import "worktree.proto";
@@ -505,7 +506,19 @@ message Envelope {
     RefreshDocumentColors refresh_document_colors = 474;
     RefreshDocumentLinks refresh_document_links = 475;
     RefreshFoldingRanges refresh_folding_ranges = 476;
-    RefreshDocumentSymbols refresh_document_symbols = 477; // current max
+    RefreshDocumentSymbols refresh_document_symbols = 477;
+    SourceControlSnapshotRequest source_control_snapshot_request = 478;
+    SourceControlSnapshotResponse source_control_snapshot_response = 479;
+    SourceControlLoadTextRequest source_control_load_text_request = 480;
+    SourceControlLoadTextResponse source_control_load_text_response = 481;
+    SourceControlHistoryRequest source_control_history_request = 482;
+    SourceControlHistoryResponse source_control_history_response = 483;
+    SourceControlBlameRequest source_control_blame_request = 484;
+    SourceControlBlameResponse source_control_blame_response = 485;
+    SourceControlExecuteRequest source_control_execute_request = 486;
+    SourceControlExecuteResponse source_control_execute_response = 487;
+    SourceControlDiffRequest source_control_diff_request = 488;
+    SourceControlDiffResponse source_control_diff_response = 489; // current max
   }
 
   reserved 87 to 88;

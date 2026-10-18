@@ -11,6 +11,22 @@ interface process {
         env: env-vars,
     }
 
+    /// A command constrained to a Zed worktree.
+    record scoped-command {
+        /// The command to execute.
+        command: string,
+        /// The arguments to pass to the command.
+        args: list<string>,
+        /// The environment variables to set for the command.
+        env: env-vars,
+        /// A working directory relative to, or equal to, the worktree root.
+        working-directory: string,
+        /// Bytes to write to standard input before waiting for the command.
+        stdin: option<list<u8>>,
+        /// Whether standard input contains data that must not be logged.
+        redact-stdin: bool,
+    }
+
     /// The output of a finished process.
     record output {
         /// The status (exit code) of the process.

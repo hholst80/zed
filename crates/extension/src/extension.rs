@@ -179,6 +179,81 @@ pub trait Extension: Send + Sync + 'static {
         locator_name: String,
         config: SpawnInTerminal,
     ) -> Result<DebugRequest>;
+
+    async fn source_control_discover(
+        &self,
+        provider_id: source_control::SourceControlProviderId,
+        worktree: Arc<dyn WorktreeDelegate>,
+    ) -> std::result::Result<
+        Vec<source_control::SourceControlRepository>,
+        source_control::SourceControlError,
+    >;
+
+    async fn source_control_status(
+        &self,
+        provider_id: source_control::SourceControlProviderId,
+        repository_id: source_control::SourceControlRepositoryId,
+        worktree: Arc<dyn WorktreeDelegate>,
+    ) -> std::result::Result<
+        Vec<source_control::SourceControlStatusEntry>,
+        source_control::SourceControlError,
+    >;
+
+    async fn source_control_load_text(
+        &self,
+        provider_id: source_control::SourceControlProviderId,
+        repository_id: source_control::SourceControlRepositoryId,
+        path: source_control::SourceControlPath,
+        revision: Option<source_control::SourceControlRevision>,
+        worktree: Arc<dyn WorktreeDelegate>,
+    ) -> std::result::Result<Option<Vec<u8>>, source_control::SourceControlError>;
+
+    async fn source_control_diff(
+        &self,
+        _provider_id: source_control::SourceControlProviderId,
+        _repository_id: source_control::SourceControlRepositoryId,
+        _path: source_control::SourceControlPath,
+        _worktree: Arc<dyn WorktreeDelegate>,
+    ) -> std::result::Result<Option<Arc<str>>, source_control::SourceControlError> {
+        Err(source_control::SourceControlError::unsupported(
+            source_control::SourceControlCapability::Diff,
+        ))
+    }
+
+    async fn source_control_history(
+        &self,
+        provider_id: source_control::SourceControlProviderId,
+        repository_id: source_control::SourceControlRepositoryId,
+        path: Option<source_control::SourceControlPath>,
+        limit: usize,
+        worktree: Arc<dyn WorktreeDelegate>,
+    ) -> std::result::Result<
+        Vec<source_control::SourceControlHistoryEntry>,
+        source_control::SourceControlError,
+    >;
+
+    async fn source_control_blame(
+        &self,
+        provider_id: source_control::SourceControlProviderId,
+        repository_id: source_control::SourceControlRepositoryId,
+        path: source_control::SourceControlPath,
+        worktree: Arc<dyn WorktreeDelegate>,
+    ) -> std::result::Result<
+        Vec<source_control::SourceControlBlameLine>,
+        source_control::SourceControlError,
+    >;
+
+    async fn source_control_execute(
+        &self,
+        provider_id: source_control::SourceControlProviderId,
+        repository_id: source_control::SourceControlRepositoryId,
+        operation: source_control::SourceControlOperation,
+        options: source_control::SourceControlExecutionOptions,
+        worktree: Arc<dyn WorktreeDelegate>,
+    ) -> std::result::Result<
+        source_control::SourceControlOperationOutput,
+        source_control::SourceControlError,
+    >;
 }
 
 pub fn parse_wasm_extension_version(extension_id: &str, wasm_bytes: &[u8]) -> Result<Version> {

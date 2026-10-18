@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: script/install-zed-local
+
+Install an existing Linux bundle and precompiled SVN extension beneath
+target/container/local. This does not compile anything or modify the official
+Zed installation or profile.
+EOF
+}
+
+if [[ $# -gt 0 ]]; then
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+fi
+
+script_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repository_root="$(cd -- "${script_directory}/.." && pwd)"
+architecture="$(uname -m)"
+archive="${repository_root}/target/container/release/zed-linux-${architecture}.tar.gz"
+svn_wasm="${repository_root}/target/container/wasm32-wasip2/release/zed_svn.wasm"
+svn_manifest="${repository_root}/extensions/svn/extension.toml"
+launcher_template="${repository_root}/script/zed-local-launcher"
+
+for required_file in "${archive}" "${svn_wasm}" "${svn_manifest}" "${launcher_template}"; do
+    if [[ ! -f "${required_file}" ]]; then
+        echo "Required local-install artifact is missing: ${required_file}" >&2
+        exit 1
+    fi
+done
+
+channel="$(tr -d '\r\n' < "${repository_root}/crates/zed/RELEASE_CHANNEL")"
+if [[ ! "${channel}" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    echo "Invalid Zed release channel: ${channel}" >&2
+    exit 1
+fi
+
+app_suffix=""
+if [[ "${channel}" != stable ]]; then
+    app_suffix="-${channel}"
+fi
+app_name="zed${app_suffix}.app"
+local_root="${repository_root}/target/container/local"
+builds_root="${local_root}/builds"
+mkdir -p "${builds_root}"
+
+staging_directory="$(mktemp -d "${builds_root}/.install.XXXXXX")"
+cleanup_staging() {
+    if [[ -d "${staging_directory}" ]]; then
+        find -P "${staging_directory}" -depth -delete
+    fi
+}
+trap cleanup_staging EXIT
+
+tar -xzf "${archive}" -C "${staging_directory}"
+staged_app="${staging_directory}/${app_name}"
+if [[ ! -x "${staged_app}/bin/zed" || ! -x "${staged_app}/libexec/zed-editor" ]]; then
+    echo "Linux bundle does not contain the expected ${app_name} layout" >&2
+    exit 1
+fi
+
+bundled_svn="${staged_app}/share/zed/extensions/subversion"
+mkdir -p "${bundled_svn}"
+install -m 0644 "${svn_manifest}" "${bundled_svn}/extension.toml"
+install -m 0644 "${svn_wasm}" "${bundled_svn}/extension.wasm"
+install -m 0755 "${launcher_template}" "${staged_app}/bin/zed-subversion"
+
+payload_hash="$({
+    sha256sum "${archive}" "${svn_wasm}" "${svn_manifest}" "${launcher_template}" |
+        cut -d ' ' -f1
+} | sha256sum | cut -c1-12)"
+version_output="$("${staged_app}/bin/zed" --version)"
+if [[ "${version_output}" =~ ([0-9a-f]{40}) ]]; then
+    application_commit="${BASH_REMATCH[1]:0:12}"
+else
+    echo "Could not determine the bundled Zed commit from: ${version_output}" >&2
+    exit 1
+fi
+
+build_id="${application_commit}-${payload_hash}"
+install_directory="${builds_root}/${build_id}"
+installed_app="${install_directory}/${app_name}"
+
+if [[ -e "${install_directory}" ]]; then
+    if [[ ! -x "${installed_app}/bin/zed-subversion" \
+        || ! -x "${installed_app}/libexec/zed-editor" \
+        || ! -f "${installed_app}/share/zed/extensions/subversion/extension.wasm" ]]; then
+        echo "Existing local install is incomplete: ${install_directory}" >&2
+        exit 1
+    fi
+    cleanup_staging
+else
+    mv "${staging_directory}" "${install_directory}"
+fi
+trap - EXIT
+
+profile_extensions="${local_root}/user-data/extensions/installed"
+profile_svn="${profile_extensions}/subversion"
+profile_marker="${profile_svn}/.zed-subversion-bundle"
+svn_hash="$(sha256sum "${svn_wasm}" | cut -d ' ' -f1)"
+mkdir -p "${profile_extensions}"
+
+if [[ -e "${profile_svn}" || -L "${profile_svn}" ]]; then
+    if [[ ! -d "${profile_svn}" || -L "${profile_svn}" || ! -f "${profile_marker}" ]]; then
+        echo "Refusing to replace an unmanaged local-profile extension: ${profile_svn}" >&2
+        exit 1
+    fi
+fi
+
+profile_is_current=false
+if [[ -f "${profile_marker}" \
+    && "$(tr -d '\r\n' < "${profile_marker}")" == "${svn_hash}" \
+    && -f "${profile_svn}/extension.toml" \
+    && -f "${profile_svn}/extension.wasm" ]] \
+    && cmp -s "${svn_manifest}" "${profile_svn}/extension.toml" \
+    && cmp -s "${svn_wasm}" "${profile_svn}/extension.wasm"; then
+    profile_is_current=true
+fi
+
+if [[ "${profile_is_current}" == false ]]; then
+    profile_staging="$(mktemp -d "${profile_extensions}/.subversion.XXXXXX")"
+    profile_backup=""
+    cleanup_profile_update() {
+        if [[ -d "${profile_staging}" ]]; then
+            find -P "${profile_staging}" -depth -delete
+        fi
+        if [[ -n "${profile_backup}" && -d "${profile_backup}" ]]; then
+            if [[ ! -e "${profile_svn}" && ! -L "${profile_svn}" ]]; then
+                mv "${profile_backup}" "${profile_svn}"
+            else
+                find -P "${profile_backup}" -depth -delete
+            fi
+        fi
+    }
+    trap cleanup_profile_update EXIT
+    install -m 0644 "${svn_manifest}" "${profile_staging}/extension.toml"
+    install -m 0644 "${svn_wasm}" "${profile_staging}/extension.wasm"
+    printf '%s\n' "${svn_hash}" > "${profile_staging}/.zed-subversion-bundle"
+    if [[ -d "${profile_svn}" ]]; then
+        profile_backup="${profile_extensions}/.subversion.previous.$$"
+        if [[ -e "${profile_backup}" || -L "${profile_backup}" ]]; then
+            echo "Refusing to replace unexpected profile backup: ${profile_backup}" >&2
+            exit 1
+        fi
+        mv "${profile_svn}" "${profile_backup}"
+    fi
+    mv "${profile_staging}" "${profile_svn}"
+    profile_staging=""
+    if [[ -n "${profile_backup}" ]]; then
+        find -P "${profile_backup}" -depth -delete
+        profile_backup=""
+    fi
+    trap - EXIT
+fi
+
+if [[ -e "${local_root}/current" && ! -L "${local_root}/current" ]]; then
+    echo "Refusing to replace non-symlink: ${local_root}/current" >&2
+    exit 1
+fi
+if [[ -e "${local_root}/zed" && ! -L "${local_root}/zed" ]]; then
+    echo "Refusing to replace non-symlink: ${local_root}/zed" >&2
+    exit 1
+fi
+ln -sfn "builds/${build_id}/${app_name}" "${local_root}/current"
+ln -sfn "current/bin/zed-subversion" "${local_root}/zed"
+
+echo "Local Zed application: ${installed_app}"
+echo "Local Zed launcher: ${local_root}/zed"
+echo "Local Zed profile: ${local_root}/user-data"
+echo "Bundled SVN extension: ${profile_svn}/extension.wasm"

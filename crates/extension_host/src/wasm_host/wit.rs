@@ -30,6 +30,7 @@ use wasmtime::{
 
 #[cfg(test)]
 pub use latest::CodeLabelSpanLiteral;
+pub use latest::zed::extension::source_control;
 pub use latest::{
     CodeLabel, CodeLabelSpan, Command, DebugAdapterBinary, ExtensionProject, Range, SlashCommand,
     zed::extension::context_server::ContextServerConfiguration,
@@ -37,6 +38,13 @@ pub use latest::{
         Completion, CompletionKind, CompletionLabelDetails, InsertTextFormat, Symbol, SymbolKind,
     },
     zed::extension::slash_command::{SlashCommandArgumentCompletion, SlashCommandOutput},
+};
+pub use latest::{
+    source_control_blame_from_wit, source_control_error_from_wit,
+    source_control_execution_options_to_wit, source_control_history_from_wit,
+    source_control_operation_output_from_wit, source_control_operation_to_wit,
+    source_control_repository_from_wit, source_control_revision_to_wit,
+    source_control_status_from_wit,
 };
 pub use since_v0_0_4::LanguageServerConfig;
 
@@ -1266,6 +1274,153 @@ impl Extension {
             | Extension::V0_0_1(_) => {
                 anyhow::bail!("`run_dap_locator` not available prior to v0.6.0");
             }
+        }
+    }
+
+    pub async fn call_source_control_discover(
+        &self,
+        store: &mut Store<WasmState>,
+        provider_id: &str,
+        resource: Resource<Arc<dyn WorktreeDelegate>>,
+    ) -> Result<Result<Vec<source_control::Repository>, source_control::ProviderError>> {
+        match self {
+            Extension::V0_8_0(extension) => {
+                extension
+                    .call_source_control_discover(store, provider_id, resource)
+                    .await
+            }
+            _ => anyhow::bail!("source-control providers require extension API 0.8"),
+        }
+    }
+
+    pub async fn call_source_control_status(
+        &self,
+        store: &mut Store<WasmState>,
+        provider_id: &str,
+        repository_id: &str,
+        resource: Resource<Arc<dyn WorktreeDelegate>>,
+    ) -> Result<Result<Vec<source_control::StatusEntry>, source_control::ProviderError>> {
+        match self {
+            Extension::V0_8_0(extension) => {
+                extension
+                    .call_source_control_status(store, provider_id, repository_id, resource)
+                    .await
+            }
+            _ => anyhow::bail!("source-control providers require extension API 0.8"),
+        }
+    }
+
+    pub async fn call_source_control_load_text(
+        &self,
+        store: &mut Store<WasmState>,
+        provider_id: &str,
+        repository_id: &str,
+        path: &str,
+        revision: Option<&source_control::Revision>,
+        resource: Resource<Arc<dyn WorktreeDelegate>>,
+    ) -> Result<Result<Option<Vec<u8>>, source_control::ProviderError>> {
+        match self {
+            Extension::V0_8_0(extension) => {
+                extension
+                    .call_source_control_load_text(
+                        store,
+                        provider_id,
+                        repository_id,
+                        path,
+                        revision,
+                        resource,
+                    )
+                    .await
+            }
+            _ => anyhow::bail!("source-control providers require extension API 0.8"),
+        }
+    }
+
+    pub async fn call_source_control_diff(
+        &self,
+        store: &mut Store<WasmState>,
+        provider_id: &str,
+        repository_id: &str,
+        path: &str,
+        resource: Resource<Arc<dyn WorktreeDelegate>>,
+    ) -> Result<Result<Option<String>, source_control::ProviderError>> {
+        match self {
+            Extension::V0_8_0(extension) => {
+                extension
+                    .call_source_control_diff(store, provider_id, repository_id, path, resource)
+                    .await
+            }
+            _ => anyhow::bail!("source-control providers require extension API 0.8"),
+        }
+    }
+
+    pub async fn call_source_control_history(
+        &self,
+        store: &mut Store<WasmState>,
+        provider_id: &str,
+        repository_id: &str,
+        path: Option<&str>,
+        limit: u32,
+        resource: Resource<Arc<dyn WorktreeDelegate>>,
+    ) -> Result<Result<Vec<source_control::HistoryEntry>, source_control::ProviderError>> {
+        match self {
+            Extension::V0_8_0(extension) => {
+                extension
+                    .call_source_control_history(
+                        store,
+                        provider_id,
+                        repository_id,
+                        path,
+                        limit,
+                        resource,
+                    )
+                    .await
+            }
+            _ => anyhow::bail!("source-control providers require extension API 0.8"),
+        }
+    }
+
+    pub async fn call_source_control_blame(
+        &self,
+        store: &mut Store<WasmState>,
+        provider_id: &str,
+        repository_id: &str,
+        path: &str,
+        resource: Resource<Arc<dyn WorktreeDelegate>>,
+    ) -> Result<Result<Vec<source_control::BlameLine>, source_control::ProviderError>> {
+        match self {
+            Extension::V0_8_0(extension) => {
+                extension
+                    .call_source_control_blame(store, provider_id, repository_id, path, resource)
+                    .await
+            }
+            _ => anyhow::bail!("source-control providers require extension API 0.8"),
+        }
+    }
+
+    pub async fn call_source_control_execute(
+        &self,
+        store: &mut Store<WasmState>,
+        provider_id: &str,
+        repository_id: &str,
+        operation: &source_control::Operation,
+        options: &source_control::ExecutionOptions,
+        resource: Resource<Arc<dyn WorktreeDelegate>>,
+    ) -> Result<Result<source_control::OperationOutput, source_control::ProviderError>> {
+        match self {
+            Extension::V0_8_0(extension) => {
+                extension
+                    .call_source_control_execute(
+                        store,
+                        provider_id,
+                        repository_id,
+                        operation,
+                        options,
+                        resource,
+                    )
+                    .await
+            }
+            _ => anyhow::bail!("source-control providers require extension API 0.8"),
         }
     }
 }

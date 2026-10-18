@@ -1,5 +1,5 @@
 use git_ui_core::askpass_modal::AskPassModal;
-pub(crate) use git_ui_core::notifications::{open_output, show_error_toast};
+pub(crate) use git_ui_core::notifications::{open_named_output, open_output, show_error_toast};
 
 use crate::commit_context_menu::{
     CommitContextMenuData, CommitContextMenuSource, commit_context_menu,
@@ -19,7 +19,7 @@ use crate::{
 };
 use agent_settings::{AgentSettings, UserAgentsMd};
 use anyhow::Context as _;
-use askpass::AskPassDelegate;
+use askpass::{AskPassDelegate, IKnowWhatIAmDoingAndIHaveReadTheDocs};
 use client::zed_urls;
 use collections::{BTreeMap, HashMap, HashSet};
 use db::kvp::KeyValueStore;
@@ -70,6 +70,7 @@ use project::{
         CommitDataState, GitStoreEvent, Repository, RepositoryEvent, RepositoryId, pending_op,
     },
     project_settings::{GitPathStyle, ProjectSettings},
+    source_control_store::{SourceControlRepositorySnapshot, SourceControlStoreEvent},
 };
 use prompt_store::RULES_FILE_NAMES;
 
@@ -79,6 +80,13 @@ use settings::{
     update_settings_file,
 };
 use smallvec::SmallVec;
+use source_control::{
+    SourceControlAuthentication, SourceControlCapabilities, SourceControlContentStatus,
+    SourceControlErrorKind, SourceControlExecutionOptions, SourceControlOperation,
+    SourceControlPath, SourceControlProviderId, SourceControlRepositoryId,
+    SourceControlRepositoryKey, SourceControlSelectionEligibility, SourceControlStatusEntry,
+    SourceControlTrustDecision,
+};
 use std::cell::Cell;
 use std::future::Future;
 use std::ops::Range;
@@ -100,11 +108,17 @@ use workspace::SERIALIZATION_THROTTLE_TIME;
 use workspace::{
     Item, ModalView, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
+    item::PreviewTabsSettings,
     notifications::{DetachAndPromptErr, NotificationId, NotifyTaskExt},
 };
 use zed_actions::{
     DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize,
     git_panel::ToggleFocus,
+    source_control::{
+        Checkout as CheckoutSourceControl, Refresh as RefreshSourceControl, SelectRepository,
+        Switch as SwitchSourceControl, ToggleFocus as ToggleSourceControlFocus,
+        Update as UpdateSourceControl,
+    },
     workspace::{CopyPath, CopyRelativePath},
 };
 
@@ -206,6 +220,114 @@ struct GitPanelViewOptionsMenuState {
 struct StashMessageModal {
     editor: Entity<Editor>,
     panel: WeakEntity<GitPanel>,
+}
+
+#[derive(Clone, Copy)]
+enum SourceControlUrlOperation {
+    Switch,
+    Checkout,
+}
+
+#[derive(Clone)]
+struct SourceControlOperationRequest {
+    repository: SourceControlRepositoryKey,
+    operation: SourceControlOperation,
+    options: SourceControlExecutionOptions,
+    name: &'static str,
+    clear_commit_message: bool,
+}
+
+struct SourceControlUrlModal {
+    editor: Entity<Editor>,
+    panel: WeakEntity<GitPanel>,
+    repository: SourceControlRepositoryKey,
+    operation: SourceControlUrlOperation,
+}
+
+impl SourceControlUrlModal {
+    fn new(
+        panel: WeakEntity<GitPanel>,
+        repository: SourceControlRepositoryKey,
+        operation: SourceControlUrlOperation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("https://svn.example.com/repository/path", window, cx);
+            editor
+        });
+        Self {
+            editor,
+            panel,
+            repository,
+            operation,
+        }
+    }
+
+    fn cancel(&mut self, _: &menu::Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+
+    fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        let url = self.editor.read(cx).text(cx).trim().to_owned();
+        if url.is_empty() {
+            return;
+        }
+        let repository = self.repository.clone();
+        let operation = self.operation;
+        self.panel
+            .update(cx, |panel, cx| match operation {
+                SourceControlUrlOperation::Switch => panel.execute_source_control_operation(
+                    repository,
+                    SourceControlOperation::Switch {
+                        url,
+                        revision: None,
+                    },
+                    "Subversion switch",
+                    false,
+                    window,
+                    cx,
+                ),
+                SourceControlUrlOperation::Checkout => {
+                    panel.checkout_source_control(repository, url, window, cx)
+                }
+            })
+            .ok();
+        cx.emit(DismissEvent);
+    }
+}
+
+impl EventEmitter<DismissEvent> for SourceControlUrlModal {}
+impl ModalView for SourceControlUrlModal {}
+impl Focusable for SourceControlUrlModal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.editor.focus_handle(cx)
+    }
+}
+
+impl Render for SourceControlUrlModal {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let title = match self.operation {
+            SourceControlUrlOperation::Switch => "Switch Subversion Working Copy",
+            SourceControlUrlOperation::Checkout => "Check Out Subversion Repository",
+        };
+        v_flex()
+            .key_context("SourceControlUrlModal")
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::confirm))
+            .elevation_2(cx)
+            .w(rems(38.))
+            .child(
+                h_flex()
+                    .px_3()
+                    .pt_2()
+                    .pb_1()
+                    .w_full()
+                    .child(Headline::new(title).size(HeadlineSize::XSmall)),
+            )
+            .child(div().px_3().pb_3().w_full().child(self.editor.clone()))
+    }
 }
 
 impl StashMessageModal {
@@ -456,6 +578,48 @@ pub fn register(workspace: &mut Workspace) {
             workspace.close_panel::<GitPanel>(window, cx);
         }
     });
+    workspace.register_action(|workspace, _: &ToggleSourceControlFocus, window, cx| {
+        workspace.toggle_panel_focus::<GitPanel>(window, cx);
+    });
+    workspace.register_action(|workspace, _: &SelectRepository, window, cx| {
+        crate::repository_selector::open(workspace, &zed_actions::git::SelectRepo, window, cx);
+    });
+    workspace.register_action(|workspace, _: &RefreshSourceControl, _window, cx| {
+        let source_control_store = workspace.project().read(cx).source_control_store().clone();
+        source_control_store.update(cx, |store, cx| store.refresh(cx));
+    });
+    workspace.register_action(|workspace, _: &UpdateSourceControl, window, cx| {
+        if let Some(panel) = workspace.panel::<GitPanel>(cx) {
+            panel.update(cx, |panel, cx| {
+                let Some((snapshot, _)) = panel.active_extension_source_control_repository(cx)
+                else {
+                    return;
+                };
+                panel.execute_source_control_operation(
+                    snapshot.repository.key,
+                    SourceControlOperation::Update,
+                    "source control update",
+                    false,
+                    window,
+                    cx,
+                );
+            });
+        }
+    });
+    workspace.register_action(|workspace, _: &SwitchSourceControl, window, cx| {
+        if let Some(panel) = workspace.panel::<GitPanel>(cx) {
+            panel.update(cx, |panel, cx| {
+                panel.prompt_source_control_url(SourceControlUrlOperation::Switch, window, cx)
+            });
+        }
+    });
+    workspace.register_action(|workspace, _: &CheckoutSourceControl, window, cx| {
+        if let Some(panel) = workspace.panel::<GitPanel>(cx) {
+            panel.update(cx, |panel, cx| {
+                panel.prompt_source_control_url(SourceControlUrlOperation::Checkout, window, cx)
+            });
+        }
+    });
     workspace.register_action(|workspace, _: &ExpandCommitEditor, window, cx| {
         CommitModal::toggle(workspace, None, window, cx)
     });
@@ -491,6 +655,14 @@ struct SerializedGitPanel {
     signoff_enabled: bool,
     #[serde(default)]
     commit_messages: BTreeMap<String, SerializedCommitMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_source_control_repository: Option<SerializedSourceControlRepository>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SerializedSourceControlRepository {
+    provider_id: String,
+    repository_id: String,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -987,8 +1159,33 @@ struct GitPanelContextMenu {
     _subscription: Subscription,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum SourceControlSection {
+    Conflicts,
+    Included,
+    Excluded,
+    Unversioned,
+    Missing,
+}
+
+impl SourceControlSection {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Conflicts => "Conflicts",
+            Self::Included => "Included Changes",
+            Self::Excluded => "Excluded Changes",
+            Self::Unversioned => "Unversioned",
+            Self::Missing => "Missing",
+        }
+    }
+}
+
 pub struct GitPanel {
     pub(crate) active_repository: Option<Entity<Repository>>,
+    pending_active_source_control_repository: Option<SourceControlRepositoryKey>,
+    source_control_inclusions: BTreeMap<SourceControlRepositoryKey, HashSet<SourceControlPath>>,
+    source_control_exclusions: BTreeMap<SourceControlRepositoryKey, HashSet<SourceControlPath>>,
+    pending_source_control_operation: bool,
     pub(crate) commit_editor: Entity<Editor>,
     /// Whether the commit editor should fill the vertical height of the panel.
     commit_editor_expanded: bool,
@@ -1137,6 +1334,15 @@ impl GitPanel {
         let signoff_enabled = serialized_panel
             .as_ref()
             .is_some_and(|panel| panel.signoff_enabled);
+        let pending_active_source_control_repository = serialized_panel
+            .as_ref()
+            .and_then(|panel| panel.active_source_control_repository.as_ref())
+            .and_then(|repository| {
+                Some(SourceControlRepositoryKey::new(
+                    SourceControlProviderId::new(repository.provider_id.clone()).ok()?,
+                    SourceControlRepositoryId::new(repository.repository_id.clone()).ok()?,
+                ))
+            });
         let active_work_directory_abs_path = active_repository.as_ref().map(|repository| {
             repository
                 .read(cx)
@@ -1291,8 +1497,44 @@ impl GitPanel {
             )
             .detach();
 
+            let source_control_store = project.read(cx).source_control_store().clone();
+            cx.subscribe(
+                &source_control_store,
+                |this, _, event: &SourceControlStoreEvent, cx| {
+                    if matches!(event, SourceControlStoreEvent::RepositoriesChanged) {
+                        let panel = cx.entity().downgrade();
+                        cx.defer(move |cx| {
+                            panel
+                                .update(cx, |panel, cx| {
+                                    panel.restore_active_source_control_repository(cx)
+                                })
+                                .ok();
+                        });
+                    }
+                    if matches!(event, SourceControlStoreEvent::ActiveRepositoryChanged(_)) {
+                        if this.pending_active_source_control_repository.is_none() {
+                            this.serialize(cx);
+                        }
+                    }
+                    if matches!(
+                        event,
+                        SourceControlStoreEvent::RepositoriesChanged
+                            | SourceControlStoreEvent::RepositoryUpdated(_)
+                            | SourceControlStoreEvent::ActiveRepositoryChanged(_)
+                    ) {
+                        this.reconcile_source_control_selection(cx);
+                        cx.notify();
+                    }
+                },
+            )
+            .detach();
+
             let mut this = Self {
                 active_repository,
+                pending_active_source_control_repository,
+                source_control_inclusions: BTreeMap::default(),
+                source_control_exclusions: BTreeMap::default(),
+                pending_source_control_operation: false,
                 commit_editor,
                 commit_editor_expanded: false,
                 conflicted_count: 0,
@@ -1354,6 +1596,8 @@ impl GitPanel {
             };
 
             this.schedule_update(window, cx);
+            this.restore_active_source_control_repository(cx);
+            this.reconcile_source_control_selection(cx);
             this
         })
     }
@@ -1466,6 +1710,19 @@ impl GitPanel {
     fn serialize(&mut self, cx: &mut Context<Self>) {
         let signoff_enabled = self.signoff_enabled;
         let commit_messages = self.serialized_commit_messages(cx);
+        let active_source_control_repository = self
+            .project
+            .read(cx)
+            .source_control_store()
+            .read(cx)
+            .active_repository()
+            .filter(|snapshot| {
+                snapshot.repository.key.provider_id != SourceControlProviderId::git()
+            })
+            .map(|snapshot| SerializedSourceControlRepository {
+                provider_id: snapshot.repository.key.provider_id.as_str().to_owned(),
+                repository_id: snapshot.repository.key.repository_id.as_str().to_owned(),
+            });
         let kvp = KeyValueStore::global(cx);
 
         self.pending_serialization = cx.spawn(async move |git_panel, cx| {
@@ -1492,6 +1749,7 @@ impl GitPanel {
                         serde_json::to_string(&SerializedGitPanel {
                             signoff_enabled,
                             commit_messages,
+                            active_source_control_repository,
                         })?,
                     )
                     .await?;
@@ -1501,6 +1759,19 @@ impl GitPanel {
             )
             .await;
         });
+    }
+
+    fn restore_active_source_control_repository(&mut self, cx: &mut Context<Self>) {
+        let Some(repository) = self.pending_active_source_control_repository.take() else {
+            return;
+        };
+        let source_control_store = self.project.read(cx).source_control_store().clone();
+        let restored = source_control_store.update(cx, |store, cx| {
+            store.set_active_repository(repository.clone(), cx)
+        });
+        if !restored {
+            self.pending_active_source_control_repository = Some(repository);
+        }
     }
 
     fn serialized_commit_messages(&self, cx: &App) -> BTreeMap<String, SerializedCommitMessage> {
@@ -7005,10 +7276,22 @@ impl GitPanel {
     fn render_uninitialized_ui(&self, cx: &mut Context<Self>) -> AnyElement {
         let worktree_count = self.project.read(cx).visible_worktrees(cx).count();
         if worktree_count > 0 && self.active_repository.is_none() {
+            let source_control_store = self.project.read(cx).source_control_store().clone();
+            let provider_failure = source_control_store.read_with(cx, |store, cx| {
+                store.provider_errors().next().map(|(provider_id, error)| {
+                    let provider_name = store
+                        .provider_display_name(provider_id, cx)
+                        .unwrap_or_else(|| Arc::from(provider_id.as_str().to_owned()));
+                    format!("{provider_name}: {error}")
+                })
+            });
             v_flex()
                 .gap_1()
                 .items_center()
-                .child(Label::new("No Git Repositories").color(Color::Muted))
+                .child(Label::new("No Source Control Repositories").color(Color::Muted))
+                .when_some(provider_failure, |this, failure| {
+                    this.child(Label::new(failure).color(Color::Error))
+                })
                 .child(
                     Button::new("initialize_repository", "Initialize Repository")
                         .label_size(LabelSize::Small)
@@ -7028,7 +7311,7 @@ impl GitPanel {
         } else if worktree_count == 0 {
             let focus_handle = self.focus_handle.clone();
             ProjectEmptyState::new(
-                "Git Panel",
+                "Source Control Panel",
                 focus_handle.clone(),
                 KeyBinding::for_action_in(&workspace::Open::default(), &focus_handle, cx),
             )
@@ -8227,6 +8510,1439 @@ impl GitPanel {
     }
 }
 
+impl GitPanel {
+    fn active_extension_source_control_repository(
+        &self,
+        cx: &App,
+    ) -> Option<(SourceControlRepositorySnapshot, Arc<str>)> {
+        let source_control_store = self.project.read(cx).source_control_store().clone();
+        source_control_store.read_with(cx, |store, cx| {
+            let snapshot = store.active_repository()?.clone();
+            if snapshot.repository.key.provider_id == SourceControlProviderId::git() {
+                return None;
+            }
+            let provider_name = store
+                .provider_display_name(&snapshot.repository.key.provider_id, cx)
+                .unwrap_or_else(|| {
+                    Arc::from(snapshot.repository.key.provider_id.as_str().to_owned())
+                });
+            Some((snapshot, provider_name))
+        })
+    }
+
+    fn reconcile_source_control_selection(&mut self, cx: &App) {
+        let source_control_store = self.project.read(cx).source_control_store().clone();
+        let changed_paths = source_control_store.read_with(cx, |store, _| {
+            store
+                .repositories()
+                .map(|snapshot| {
+                    (
+                        snapshot.repository.key.clone(),
+                        snapshot
+                            .statuses
+                            .iter()
+                            .map(|status| status.path.clone())
+                            .collect::<HashSet<_>>(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        });
+        for selections in [
+            &mut self.source_control_inclusions,
+            &mut self.source_control_exclusions,
+        ] {
+            selections.retain(|key, paths| {
+                let Some(current_paths) = changed_paths.get(key) else {
+                    return false;
+                };
+                paths.retain(|path| current_paths.contains(path));
+                !paths.is_empty()
+            });
+        }
+    }
+
+    fn source_control_path_selected(
+        &self,
+        key: &SourceControlRepositoryKey,
+        status: &SourceControlStatusEntry,
+    ) -> bool {
+        match status.selection {
+            SourceControlSelectionEligibility::IncludedByDefault => self
+                .source_control_exclusions
+                .get(key)
+                .is_none_or(|paths| !paths.contains(&status.path)),
+            SourceControlSelectionEligibility::Available => self
+                .source_control_inclusions
+                .get(key)
+                .is_some_and(|paths| paths.contains(&status.path)),
+            SourceControlSelectionEligibility::RequiresAdd
+            | SourceControlSelectionEligibility::RequiresDelete
+            | SourceControlSelectionEligibility::Unavailable => false,
+        }
+    }
+
+    fn toggle_source_control_path(
+        &mut self,
+        key: SourceControlRepositoryKey,
+        status: SourceControlStatusEntry,
+        cx: &mut Context<Self>,
+    ) {
+        let selected = self.source_control_path_selected(&key, &status);
+        match status.selection {
+            SourceControlSelectionEligibility::IncludedByDefault => {
+                let exclusions = self.source_control_exclusions.entry(key).or_default();
+                if selected {
+                    exclusions.insert(status.path);
+                } else {
+                    exclusions.remove(&status.path);
+                }
+            }
+            SourceControlSelectionEligibility::Available => {
+                let inclusions = self.source_control_inclusions.entry(key).or_default();
+                if selected {
+                    inclusions.remove(&status.path);
+                } else {
+                    inclusions.insert(status.path);
+                }
+            }
+            SourceControlSelectionEligibility::RequiresAdd
+            | SourceControlSelectionEligibility::RequiresDelete
+            | SourceControlSelectionEligibility::Unavailable => return,
+        }
+        cx.notify();
+    }
+
+    fn prompt_source_control_url(
+        &mut self,
+        operation: SourceControlUrlOperation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((snapshot, _)) = self.active_extension_source_control_repository(cx) else {
+            return;
+        };
+        let supported = match operation {
+            SourceControlUrlOperation::Switch => snapshot.repository.capabilities.switch,
+            SourceControlUrlOperation::Checkout => snapshot.repository.capabilities.checkout,
+        };
+        if !supported || self.pending_source_control_operation {
+            return;
+        }
+
+        let repository = snapshot.repository.key;
+        cx.defer_in(window, move |this, window, cx| {
+            let panel = cx.entity().downgrade();
+            this.workspace
+                .update(cx, |workspace, cx| {
+                    workspace.toggle_modal(window, cx, |window, cx| {
+                        SourceControlUrlModal::new(panel, repository.clone(), operation, window, cx)
+                    });
+                })
+                .ok();
+        });
+    }
+
+    fn checkout_source_control(
+        &mut self,
+        repository: SourceControlRepositoryKey,
+        url: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let destination_prompt = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Select Subversion Checkout Destination".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(mut destinations))) = destination_prompt.await else {
+                return;
+            };
+            let Some(destination) = destinations.pop() else {
+                return;
+            };
+            this.update_in(cx, |this, window, cx| {
+                this.execute_source_control_operation(
+                    repository,
+                    SourceControlOperation::Checkout {
+                        url,
+                        destination,
+                        revision: None,
+                    },
+                    "Subversion checkout",
+                    false,
+                    window,
+                    cx,
+                );
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn execute_source_control_operation(
+        &mut self,
+        key: SourceControlRepositoryKey,
+        operation: SourceControlOperation,
+        operation_name: &'static str,
+        clear_commit_message: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.execute_source_control_operation_request(
+            SourceControlOperationRequest {
+                repository: key,
+                operation,
+                options: SourceControlExecutionOptions::default(),
+                name: operation_name,
+                clear_commit_message,
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn execute_source_control_operation_request(
+        &mut self,
+        request: SourceControlOperationRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pending_source_control_operation {
+            return;
+        }
+        let source_control_store = self.project.read(cx).source_control_store().clone();
+        let task = source_control_store.update(cx, |store, cx| {
+            store.execute_with_options(
+                &request.repository,
+                request.operation.clone(),
+                request.options.clone(),
+                cx,
+            )
+        });
+        self.pending_source_control_operation = true;
+        cx.notify();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            this.update_in(cx, |this, window, cx| {
+                this.pending_source_control_operation = false;
+                match result {
+                    Ok(output) => {
+                        if request.clear_commit_message {
+                            this.commit_editor
+                                .update(cx, |editor, cx| editor.clear(window, cx));
+                            this.source_control_inclusions.remove(&request.repository);
+                            this.source_control_exclusions.remove(&request.repository);
+                        }
+                        if let Some(opened_path) = output.opened_path {
+                            let project = this.project.clone();
+                            let open_task = project.update(cx, |project, cx| {
+                                project.create_worktree(&opened_path, true, cx)
+                            });
+                            cx.spawn_in(window, async move |this, cx| {
+                                if let Err(error) = open_task.await {
+                                    this.update(cx, |this, cx| {
+                                        if let Some(workspace) = this.workspace.upgrade() {
+                                            workspace.update(cx, |workspace, cx| {
+                                                workspace.show_error(
+                                                    format!(
+                                                        "Opening Subversion checkout failed: {error}"
+                                                    ),
+                                                    cx,
+                                                )
+                                            });
+                                        }
+                                    })
+                                    .ok();
+                                }
+                            })
+                            .detach();
+                        }
+                    }
+                    Err(error) => {
+                        match error.kind.clone() {
+                            SourceControlErrorKind::AuthenticationRequired {
+                                realm,
+                                username,
+                            } if request.options.authentication.is_none() => {
+                                this.prompt_source_control_authentication(
+                                    request.clone(),
+                                    realm,
+                                    username,
+                                    window,
+                                    cx,
+                                );
+                                cx.notify();
+                                return;
+                            }
+                            SourceControlErrorKind::TrustRequired {
+                                realm,
+                                fingerprint,
+                                failures,
+                            } if request.options.trust.is_none() => {
+                                this.prompt_source_control_trust(
+                                    request.clone(),
+                                    realm,
+                                    fingerprint,
+                                    failures,
+                                    window,
+                                    cx,
+                                );
+                                cx.notify();
+                                return;
+                            }
+                            _ => {}
+                        }
+                        if let Some(workspace) = this.workspace.upgrade() {
+                            workspace.update(cx, |workspace, cx| {
+                                workspace.show_error(
+                                    format!("{} failed: {error}", request.name),
+                                    cx,
+                                )
+                            });
+                        }
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn prompt_source_control_authentication(
+        &mut self,
+        mut request: SourceControlOperationRequest,
+        realm: Arc<str>,
+        suggested_username: Option<Arc<str>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut askpass = self.askpass_delegate(request.name, window, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let username = if let Some(username) = suggested_username {
+                username.to_string()
+            } else {
+                let Some(username) = askpass.ask_password(format!("Username for {realm}")).await
+                else {
+                    return;
+                };
+                let Ok(username) = username.decrypt(IKnowWhatIAmDoingAndIHaveReadTheDocs) else {
+                    return;
+                };
+                username
+            };
+            if username.is_empty() {
+                return;
+            }
+            let Some(password) = askpass
+                .ask_password(format!("Password for {username} at {realm}"))
+                .await
+            else {
+                return;
+            };
+            let Ok(password) = password.decrypt(IKnowWhatIAmDoingAndIHaveReadTheDocs) else {
+                return;
+            };
+            request.options.authentication = Some(SourceControlAuthentication {
+                username: Arc::from(username),
+                password: password.into(),
+            });
+            this.update_in(cx, |this, window, cx| {
+                this.execute_source_control_operation_request(request, window, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn prompt_source_control_trust(
+        &mut self,
+        mut request: SourceControlOperationRequest,
+        realm: Arc<str>,
+        fingerprint: Arc<str>,
+        failures: Vec<Arc<str>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let detail = format!(
+            "Realm: {realm}\nFingerprint: {fingerprint}\nFailures: {}\n\nTrust applies to this operation only and will not be saved.",
+            failures.iter().join(", ")
+        );
+        let confirmation = window.prompt(
+            PromptLevel::Warning,
+            "Trust this Subversion server certificate once?",
+            Some(&detail),
+            &["Trust Once", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if confirmation.await.ok() != Some(0) {
+                return;
+            }
+            request.options.trust = Some(SourceControlTrustDecision { failures });
+            this.update_in(cx, |this, window, cx| {
+                this.execute_source_control_operation_request(request, window, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn commit_source_control(
+        &mut self,
+        snapshot: SourceControlRepositorySnapshot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let message = self.commit_editor.read(cx).text(cx);
+        if message.trim().is_empty() {
+            self.commit_editor.focus_handle(cx).focus(window, cx);
+            return;
+        }
+        let paths = snapshot
+            .statuses
+            .iter()
+            .filter(|status| self.source_control_path_selected(&snapshot.repository.key, status))
+            .map(|status| status.path.clone())
+            .collect::<Vec<_>>();
+        if paths.is_empty() {
+            return;
+        }
+        self.execute_source_control_operation(
+            snapshot.repository.key,
+            SourceControlOperation::Commit { paths, message },
+            "Subversion commit",
+            true,
+            window,
+            cx,
+        );
+    }
+
+    fn confirm_source_control_revert(
+        &mut self,
+        key: SourceControlRepositoryKey,
+        path: SourceControlPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let confirmation = window.prompt(
+            PromptLevel::Warning,
+            &format!("Revert changes to {}?", path.as_str()),
+            Some("This discards local changes and cannot be undone."),
+            &["Revert", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if confirmation.await.ok() != Some(0) {
+                return;
+            }
+            this.update_in(cx, |this, window, cx| {
+                this.execute_source_control_operation(
+                    key,
+                    SourceControlOperation::Revert { paths: vec![path] },
+                    "Subversion revert",
+                    false,
+                    window,
+                    cx,
+                );
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn show_source_control_history(
+        &mut self,
+        key: SourceControlRepositoryKey,
+        path: SourceControlPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let source_control_store = self.project.read(cx).source_control_store().clone();
+        let task = source_control_store.update(cx, |store, cx| {
+            store.history(&key, Some(path.clone()), 100, cx)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            this.update_in(cx, |this, window, cx| match result {
+                Ok(entries) => {
+                    let output = entries
+                        .into_iter()
+                        .map(|entry| {
+                            format!(
+                                "{}  {}  {}\n{}\n",
+                                entry.revision.display,
+                                entry.author.as_deref().unwrap_or("unknown"),
+                                entry.timestamp.as_deref().unwrap_or("unknown time"),
+                                entry.message
+                            )
+                        })
+                        .join("\n");
+                    if let Some(workspace) = this.workspace.upgrade() {
+                        workspace.update(cx, |workspace, cx| {
+                            open_named_output(
+                                format!("Subversion history: {}", path.as_str()),
+                                workspace,
+                                &output,
+                                window,
+                                cx,
+                            )
+                        });
+                    }
+                }
+                Err(error) => {
+                    if let Some(workspace) = this.workspace.upgrade() {
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.show_error(
+                                format!("Loading Subversion history failed: {error}"),
+                                cx,
+                            )
+                        });
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn source_control_file_path(
+        &self,
+        key: &SourceControlRepositoryKey,
+        status: &SourceControlStatusEntry,
+        cx: &App,
+    ) -> anyhow::Result<Option<ProjectPath>> {
+        if status.node_kind == source_control::SourceControlNodeKind::Directory
+            || matches!(
+                status.content_status,
+                SourceControlContentStatus::Missing | SourceControlContentStatus::Deleted
+            )
+        {
+            return Ok(None);
+        }
+
+        let (_, _, project_path) =
+            self.resolve_source_control_project_path(key, &status.path, cx)?;
+        let entry = self
+            .project
+            .read(cx)
+            .entry_for_path(&project_path, cx)
+            .with_context(|| {
+                format!(
+                    "{} is no longer available in the project",
+                    status.path.as_str()
+                )
+            })?;
+        Ok(entry.is_file().then_some(project_path))
+    }
+
+    fn open_source_control_file(
+        &mut self,
+        key: &SourceControlRepositoryKey,
+        status: &SourceControlStatusEntry,
+        click_count: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let project_path = match self.source_control_file_path(key, status, cx) {
+            Ok(Some(path)) => path,
+            Ok(None) => return,
+            Err(error) => {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.show_error(format!("Opening source-control file failed: {error}"), cx)
+                });
+                return;
+            }
+        };
+        let focus_item = click_count > 1;
+        let allow_preview =
+            !focus_item && PreviewTabsSettings::get_global(cx).enable_preview_from_project_panel;
+        if !focus_item {
+            self.focus_handle.focus(window, cx);
+        }
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.open_path_preview(
+                    project_path,
+                    None,
+                    focus_item,
+                    allow_preview,
+                    true,
+                    window,
+                    cx,
+                )
+            })
+            .detach_and_notify_err(workspace.downgrade(), window, cx);
+    }
+
+    fn show_source_control_diff(
+        &mut self,
+        key: SourceControlRepositoryKey,
+        path: SourceControlPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let result = self.resolve_source_control_project_path(&key, &path, cx);
+        let (repository, provider_name, project_path) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.show_error(format!("Opening source-control diff failed: {error}"), cx)
+                });
+                return;
+            }
+        };
+
+        SoloDiffView::open_source_control(
+            repository,
+            path,
+            project_path,
+            provider_name,
+            workspace.downgrade(),
+            window,
+            cx,
+        )
+        .detach_and_notify_err(workspace.downgrade(), window, cx);
+    }
+
+    fn show_source_control_property_diff(
+        &mut self,
+        key: SourceControlRepositoryKey,
+        path: SourceControlPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let source_control_store = self.project.read(cx).source_control_store().clone();
+        let provider_name = source_control_store.read_with(cx, |store, cx| {
+            store
+                .provider_display_name(&key.provider_id, cx)
+                .unwrap_or_else(|| Arc::from(key.provider_id.as_str().to_owned()))
+        });
+        let task = source_control_store.update(cx, |store, cx| store.diff(&key, path.clone(), cx));
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            this.update_in(cx, |this, window, cx| match result {
+                Ok(diff) => {
+                    let output = diff
+                        .as_deref()
+                        .unwrap_or("No property differences were reported.");
+                    if let Some(workspace) = this.workspace.upgrade() {
+                        workspace.update(cx, |workspace, cx| {
+                            open_named_output(
+                                format!("{provider_name} property diff: {}", path.as_str()),
+                                workspace,
+                                output,
+                                window,
+                                cx,
+                            )
+                        });
+                    }
+                }
+                Err(error) => {
+                    if let Some(workspace) = this.workspace.upgrade() {
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.show_error(
+                                format!("Loading {provider_name} property diff failed: {error}"),
+                                cx,
+                            )
+                        });
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn show_source_control_blame(
+        &mut self,
+        key: SourceControlRepositoryKey,
+        path: SourceControlPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let result = self.resolve_source_control_project_path(&key, &path, cx);
+        let (repository, _provider_name, project_path) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                workspace.update(cx, |workspace, cx| {
+                    workspace
+                        .show_error(format!("Opening source-control blame failed: {error}"), cx)
+                });
+                return;
+            }
+        };
+        let source_control_store = self.project.read(cx).source_control_store().clone();
+        let task = source_control_store.update(cx, |store, cx| store.blame(&key, path.clone(), cx));
+        let fs = self.project.read(cx).fs().clone();
+        let absolute_path = repository
+            .repository
+            .working_copy_path
+            .join(Path::new(path.as_str()));
+        let workspace_handle = workspace.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            let reference_text = fs
+                .load(&absolute_path)
+                .await
+                .with_context(|| format!("failed to read {}", absolute_path.display()))?;
+            let lines = task.await?;
+            let entries = lines
+                .into_iter()
+                .map(|line| editor::RevisionBlameEntry {
+                    line_number: line.line_number,
+                    revision_id: line
+                        .revision
+                        .as_ref()
+                        .map(|revision| SharedString::from(revision.canonical.to_string())),
+                    revision_label: line
+                        .revision
+                        .as_ref()
+                        .map(|revision| SharedString::from(revision.display.to_string())),
+                    author: line
+                        .author
+                        .map(|author| SharedString::from(author.to_string())),
+                    timestamp: line
+                        .timestamp
+                        .map(|timestamp| SharedString::from(timestamp.to_string())),
+                })
+                .collect();
+            let item = workspace_handle
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.open_path(project_path, None, true, window, cx)
+                })?
+                .await?;
+            let editor = cx
+                .update(|_, cx| item.act_as::<Editor>(cx))?
+                .context("opened item is not an editor")?;
+            editor.update(cx, |editor, cx| {
+                editor.set_revision_blame(reference_text.into(), entries, cx)
+            });
+            anyhow::Ok(())
+        })
+        .detach_and_notify_err(workspace.downgrade(), window, cx);
+    }
+
+    fn resolve_source_control_project_path(
+        &self,
+        key: &SourceControlRepositoryKey,
+        path: &SourceControlPath,
+        cx: &App,
+    ) -> anyhow::Result<(SourceControlRepositorySnapshot, Arc<str>, ProjectPath)> {
+        let source_control_store = self.project.read(cx).source_control_store().clone();
+        let (repository, provider_name) = source_control_store.read_with(cx, |store, cx| {
+            let repository = store
+                .repository(key)
+                .cloned()
+                .context("source-control repository is no longer available")?;
+            let provider_name = store
+                .provider_display_name(&key.provider_id, cx)
+                .unwrap_or_else(|| Arc::from(key.provider_id.as_str().to_owned()));
+            anyhow::Ok((repository, provider_name))
+        })?;
+        let absolute_path = repository
+            .repository
+            .working_copy_path
+            .join(Path::new(path.as_str()));
+        let project_path = self
+            .project
+            .read(cx)
+            .project_path_for_absolute_path(&absolute_path, cx)
+            .with_context(|| {
+                format!("{} is outside the open worktrees", absolute_path.display())
+            })?;
+        Ok((repository, provider_name, project_path))
+    }
+
+    fn render_source_control_panel(
+        &mut self,
+        snapshot: SourceControlRepositorySnapshot,
+        provider_name: Arc<str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let key = snapshot.repository.key.clone();
+        let can_write = self.has_write_access(cx) && !self.project.read(cx).is_read_only(cx);
+        let mut groups = BTreeMap::<SourceControlSection, Vec<SourceControlStatusEntry>>::new();
+        for status in snapshot.statuses.iter().cloned() {
+            let selected = self.source_control_path_selected(&key, &status);
+            let section = source_control_section(&status, selected);
+            groups.entry(section).or_default().push(status);
+        }
+
+        let mut rows = Vec::new();
+        for section in [
+            SourceControlSection::Conflicts,
+            SourceControlSection::Included,
+            SourceControlSection::Excluded,
+            SourceControlSection::Unversioned,
+            SourceControlSection::Missing,
+        ] {
+            let Some(statuses) = groups.remove(&section) else {
+                continue;
+            };
+            rows.push(
+                h_flex()
+                    .px_2()
+                    .py_1()
+                    .bg(cx.theme().colors().editor_background.opacity(0.6))
+                    .child(
+                        Label::new(format!("{} ({})", section.label(), statuses.len()))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element(),
+            );
+            for status in statuses {
+                rows.push(self.render_source_control_status(
+                    &key,
+                    status,
+                    can_write,
+                    snapshot.repository.capabilities,
+                    cx,
+                ));
+            }
+        }
+
+        let header_key = key.clone();
+        let update_key = key.clone();
+        v_flex()
+            .id("source_control_panel")
+            .key_context("SourceControlPanel")
+            .track_focus(&self.focus_handle)
+            .size_full()
+            .overflow_hidden()
+            .bg(cx.theme().colors().panel_background)
+            .child(
+                h_flex()
+                    .h(Tab::container_height(cx))
+                    .w_full()
+                    .px_2()
+                    .gap_1()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border)
+                    .child(
+                        Button::new(
+                            "source-control-repository-selector",
+                            format!("{} · {}", provider_name, snapshot.repository.display_name),
+                        )
+                        .label_size(LabelSize::Small)
+                        .style(ButtonStyle::Subtle)
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(zed_actions::git::SelectRepo.boxed_clone(), cx)
+                        }),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_0p5()
+                            .child(
+                                IconButton::new("source-control-refresh", IconName::ArrowCircle)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Refresh Source Control"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        let source_control_store =
+                                            this.project.read(cx).source_control_store().clone();
+                                        source_control_store
+                                            .update(cx, |store, cx| store.refresh(cx));
+                                    })),
+                            )
+                            .when(snapshot.repository.capabilities.switch, |this| {
+                                this.child(
+                                    Button::new("source-control-switch", "Switch")
+                                        .label_size(LabelSize::Small)
+                                        .disabled(
+                                            !can_write || self.pending_source_control_operation,
+                                        )
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.prompt_source_control_url(
+                                                SourceControlUrlOperation::Switch,
+                                                window,
+                                                cx,
+                                            );
+                                        })),
+                                )
+                            })
+                            .when(snapshot.repository.capabilities.checkout, |this| {
+                                this.child(
+                                    Button::new("source-control-checkout", "Checkout")
+                                        .label_size(LabelSize::Small)
+                                        .disabled(
+                                            !can_write || self.pending_source_control_operation,
+                                        )
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.prompt_source_control_url(
+                                                SourceControlUrlOperation::Checkout,
+                                                window,
+                                                cx,
+                                            );
+                                        })),
+                                )
+                            })
+                            .when(snapshot.repository.capabilities.update, |this| {
+                                this.child(
+                                    Button::new("source-control-update", "Update")
+                                        .label_size(LabelSize::Small)
+                                        .disabled(
+                                            !can_write || self.pending_source_control_operation,
+                                        )
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.execute_source_control_operation(
+                                                update_key.clone(),
+                                                SourceControlOperation::Update,
+                                                "Subversion update",
+                                                false,
+                                                window,
+                                                cx,
+                                            );
+                                        })),
+                                )
+                            }),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .id("source-control-changes")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .when(rows.is_empty(), |this| {
+                        this.items_center()
+                            .justify_center()
+                            .child(Label::new("No changes to commit").color(Color::Muted))
+                    })
+                    .children(rows),
+            )
+            .when(snapshot.repository.capabilities.commit, |this| {
+                this.child(
+                    self.render_source_control_footer(snapshot, header_key, can_write, window, cx),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_source_control_status(
+        &self,
+        key: &SourceControlRepositoryKey,
+        status: SourceControlStatusEntry,
+        can_write: bool,
+        capabilities: SourceControlCapabilities,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let can_open_file = !matches!(self.source_control_file_path(key, &status, cx), Ok(None));
+        let open_key = key.clone();
+        let open_status = status.clone();
+        let selected = self.source_control_path_selected(key, &status);
+        let selectable = matches!(
+            status.selection,
+            SourceControlSelectionEligibility::IncludedByDefault
+                | SourceControlSelectionEligibility::Available
+        );
+        let checkbox_key = key.clone();
+        let checkbox_status = status.clone();
+        let action_key = key.clone();
+        let action_path = status.path.clone();
+        let action = match status.selection {
+            SourceControlSelectionEligibility::RequiresAdd if capabilities.add => Some(("Add", 0)),
+            SourceControlSelectionEligibility::RequiresDelete if capabilities.delete => {
+                Some(("Schedule Delete", 1))
+            }
+            _ if capabilities.resolve
+                && (status.tree_conflicted
+                    || status.content_status == SourceControlContentStatus::Conflicted
+                    || status.property_status == SourceControlContentStatus::Conflicted) =>
+            {
+                Some(("Mark Resolved", 2))
+            }
+            _ => None,
+        };
+        let can_revert = capabilities.revert
+            && status.is_changed()
+            && !matches!(
+                status.content_status,
+                SourceControlContentStatus::Unversioned
+                    | SourceControlContentStatus::Ignored
+                    | SourceControlContentStatus::External
+            );
+        let revert_key = key.clone();
+        let revert_path = status.path.clone();
+        let ignore = (capabilities.ignore
+            && status.content_status == SourceControlContentStatus::Unversioned)
+            .then(|| source_control_ignore_target(&status.path));
+        let history_key = key.clone();
+        let history_path = status.path.clone();
+        let blame_key = key.clone();
+        let blame_path = status.path.clone();
+        let diff_key = key.clone();
+        let diff_path = status.path.clone();
+        let property_diff_key = key.clone();
+        let property_diff_path = status.path.clone();
+        let (can_show_diff, can_show_property_diff) =
+            source_control_diff_options(&status, capabilities);
+        let metadata = source_control_status_metadata(&status);
+        let is_versioned_file = status.node_kind == source_control::SourceControlNodeKind::File
+            && !matches!(
+                status.content_status,
+                SourceControlContentStatus::Unversioned
+                    | SourceControlContentStatus::Ignored
+                    | SourceControlContentStatus::External
+                    | SourceControlContentStatus::Added
+            );
+
+        h_flex()
+            .id(SharedString::from(format!(
+                "source-control-status-{}",
+                status.path.as_str()
+            )))
+            .w_full()
+            .min_h_8()
+            .px_2()
+            .gap_1()
+            .border_b_1()
+            .border_color(cx.theme().colors().border.opacity(0.4))
+            .child(
+                Checkbox::new(
+                    SharedString::from(format!("source-control-select-{}", status.path.as_str())),
+                    selected.into(),
+                )
+                .disabled(!can_write || !capabilities.commit || !selectable)
+                .fill()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.toggle_source_control_path(
+                        checkbox_key.clone(),
+                        checkbox_status.clone(),
+                        cx,
+                    );
+                })),
+            )
+            .child(
+                Label::new(source_control_status_code(&status).to_owned())
+                    .size(LabelSize::Small)
+                    .color(source_control_status_color(&status)),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "source-control-file-{}",
+                        status.path.as_str()
+                    )))
+                    .debug_selector(|| format!("source-control-file-{}", status.path.as_str()))
+                    .min_w_0()
+                    .child(
+                        Label::new(status.path.as_str().to_owned())
+                            .size(LabelSize::Small)
+                            .truncate(),
+                    )
+                    .when(can_open_file, |this| {
+                        this.cursor_pointer()
+                            .hover(|style| style.bg(cx.theme().colors().element_hover))
+                            .tooltip(Tooltip::text(
+                                "Click to open; double-click to keep open and focus",
+                            ))
+                            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                                this.open_source_control_file(
+                                    &open_key,
+                                    &open_status,
+                                    event.click_count(),
+                                    window,
+                                    cx,
+                                );
+                            }))
+                    }),
+            )
+            .when_some(metadata, |this, metadata| {
+                this.child(
+                    Label::new(metadata)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            })
+            .child(div().flex_1())
+            .when(can_show_diff, |this| {
+                this.child(
+                    Button::new(
+                        SharedString::from(format!("source-control-diff-{}", diff_path.as_str())),
+                        "Diff",
+                    )
+                    .label_size(LabelSize::Small)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.show_source_control_diff(
+                            diff_key.clone(),
+                            diff_path.clone(),
+                            window,
+                            cx,
+                        );
+                    })),
+                )
+            })
+            .when(can_show_property_diff, |this| {
+                this.child(
+                    Button::new(
+                        SharedString::from(format!(
+                            "source-control-property-diff-{}",
+                            property_diff_path.as_str()
+                        )),
+                        "Properties",
+                    )
+                    .label_size(LabelSize::Small)
+                    .tooltip(Tooltip::text("Show provider property diff"))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.show_source_control_property_diff(
+                            property_diff_key.clone(),
+                            property_diff_path.clone(),
+                            window,
+                            cx,
+                        );
+                    })),
+                )
+            })
+            .when(capabilities.history && is_versioned_file, |this| {
+                this.child(
+                    IconButton::new(
+                        SharedString::from(format!(
+                            "source-control-history-{}",
+                            history_path.as_str()
+                        )),
+                        IconName::HistoryRerun,
+                    )
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Show History"))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.show_source_control_history(
+                            history_key.clone(),
+                            history_path.clone(),
+                            window,
+                            cx,
+                        );
+                    })),
+                )
+            })
+            .when(capabilities.blame && is_versioned_file, |this| {
+                this.child(
+                    Button::new(
+                        SharedString::from(format!("source-control-blame-{}", blame_path.as_str())),
+                        "Blame",
+                    )
+                    .label_size(LabelSize::Small)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.show_source_control_blame(
+                            blame_key.clone(),
+                            blame_path.clone(),
+                            window,
+                            cx,
+                        );
+                    })),
+                )
+            })
+            .when_some(action, |this, (label, action)| {
+                this.child(
+                    Button::new(
+                        SharedString::from(format!(
+                            "source-control-action-{action}-{}",
+                            action_path.as_str()
+                        )),
+                        label,
+                    )
+                    .label_size(LabelSize::Small)
+                    .disabled(!can_write || self.pending_source_control_operation)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        let operation = match action {
+                            0 => SourceControlOperation::Add {
+                                paths: vec![action_path.clone()],
+                            },
+                            1 => SourceControlOperation::Delete {
+                                paths: vec![action_path.clone()],
+                            },
+                            _ => SourceControlOperation::Resolve {
+                                paths: vec![action_path.clone()],
+                            },
+                        };
+                        this.execute_source_control_operation(
+                            action_key.clone(),
+                            operation,
+                            label,
+                            false,
+                            window,
+                            cx,
+                        );
+                    })),
+                )
+            })
+            .when(can_revert, |this| {
+                this.child(
+                    Button::new(
+                        SharedString::from(format!(
+                            "source-control-revert-{}",
+                            revert_path.as_str()
+                        )),
+                        "Revert",
+                    )
+                    .label_size(LabelSize::Small)
+                    .disabled(!can_write || self.pending_source_control_operation)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.confirm_source_control_revert(
+                            revert_key.clone(),
+                            revert_path.clone(),
+                            window,
+                            cx,
+                        );
+                    })),
+                )
+            })
+            .when_some(ignore, |this, (directory, pattern)| {
+                let ignore_key = key.clone();
+                this.child(
+                    Button::new(
+                        SharedString::from(format!(
+                            "source-control-ignore-{}",
+                            status.path.as_str()
+                        )),
+                        "Ignore",
+                    )
+                    .label_size(LabelSize::Small)
+                    .disabled(!can_write || self.pending_source_control_operation)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.execute_source_control_operation(
+                            ignore_key.clone(),
+                            SourceControlOperation::Ignore {
+                                directory: directory.clone(),
+                                pattern: pattern.clone(),
+                            },
+                            "Subversion ignore",
+                            false,
+                            window,
+                            cx,
+                        );
+                    })),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_source_control_footer(
+        &self,
+        snapshot: SourceControlRepositorySnapshot,
+        key: SourceControlRepositoryKey,
+        can_write: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let settings = ThemeSettings::get_global(cx);
+        let editor_style = git_commit_editor_style(settings.git_commit_buffer_font_size(cx), cx);
+        let selected_count = snapshot
+            .statuses
+            .iter()
+            .filter(|status| self.source_control_path_selected(&key, status))
+            .count();
+        let has_message = !self.commit_editor.read(cx).text(cx).trim().is_empty();
+
+        v_flex()
+            .border_t_1()
+            .border_color(cx.theme().colors().border)
+            .child(
+                h_flex()
+                    .px_2()
+                    .py_1()
+                    .gap_1()
+                    .child(
+                        Label::new(
+                            snapshot
+                                .repository
+                                .working_copy_path
+                                .to_string_lossy()
+                                .into_owned(),
+                        )
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .truncate(),
+                    )
+                    .when_some(snapshot.repository.summary.clone(), |this, summary| {
+                        this.child(
+                            Label::new(summary)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                    }),
+            )
+            .child(
+                panel_editor_container(window, cx)
+                    .id("source-control-commit-editor")
+                    .w_full()
+                    .h_24()
+                    .border_t_1()
+                    .border_color(cx.theme().colors().border)
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        window.focus(&this.commit_editor.focus_handle(cx), cx);
+                    }))
+                    .child(
+                        div()
+                            .p_2()
+                            .size_full()
+                            .cursor_text()
+                            .child(EditorElement::new(&self.commit_editor, editor_style)),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .p_1p5()
+                    .justify_between()
+                    .child(
+                        Label::new(format!("{selected_count} selected"))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Button::new("source-control-commit", "Commit")
+                            .label_size(LabelSize::Small)
+                            .style(ButtonStyle::Filled)
+                            .disabled(
+                                !can_write
+                                    || selected_count == 0
+                                    || !has_message
+                                    || self.pending_source_control_operation,
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.commit_source_control(snapshot.clone(), window, cx)
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+}
+
+fn source_control_section(
+    status: &SourceControlStatusEntry,
+    selected: bool,
+) -> SourceControlSection {
+    if status.tree_conflicted
+        || status.content_status == SourceControlContentStatus::Conflicted
+        || status.property_status == SourceControlContentStatus::Conflicted
+    {
+        SourceControlSection::Conflicts
+    } else if matches!(
+        status.content_status,
+        SourceControlContentStatus::Unversioned
+            | SourceControlContentStatus::Ignored
+            | SourceControlContentStatus::External
+    ) {
+        SourceControlSection::Unversioned
+    } else if status.content_status == SourceControlContentStatus::Missing {
+        SourceControlSection::Missing
+    } else if selected {
+        SourceControlSection::Included
+    } else {
+        SourceControlSection::Excluded
+    }
+}
+
+fn source_control_diff_options(
+    status: &SourceControlStatusEntry,
+    capabilities: SourceControlCapabilities,
+) -> (bool, bool) {
+    let is_supported_status = !matches!(
+        status.content_status,
+        SourceControlContentStatus::Unversioned
+            | SourceControlContentStatus::Ignored
+            | SourceControlContentStatus::External
+    );
+    let content_diff = capabilities.diff
+        && capabilities.base_text
+        && status.node_kind == source_control::SourceControlNodeKind::File
+        && is_supported_status
+        && status.content_status != SourceControlContentStatus::Normal;
+    let property_diff = capabilities.diff
+        && is_supported_status
+        && status.property_status != SourceControlContentStatus::Normal;
+    (content_diff, property_diff)
+}
+
+fn source_control_status_code(status: &SourceControlStatusEntry) -> &'static str {
+    if status.is_conflicted() {
+        "C"
+    } else {
+        match status.content_status {
+            SourceControlContentStatus::Normal
+                if status.property_status != SourceControlContentStatus::Normal =>
+            {
+                "P"
+            }
+            SourceControlContentStatus::Normal => " ",
+            SourceControlContentStatus::Modified => "M",
+            SourceControlContentStatus::Added => "A",
+            SourceControlContentStatus::Deleted => "D",
+            SourceControlContentStatus::Missing => "!",
+            SourceControlContentStatus::Replaced => "R",
+            SourceControlContentStatus::Conflicted => "C",
+            SourceControlContentStatus::Obstructed => "~",
+            SourceControlContentStatus::Unversioned => "?",
+            SourceControlContentStatus::Ignored => "I",
+            SourceControlContentStatus::External => "X",
+        }
+    }
+}
+
+fn source_control_status_metadata(status: &SourceControlStatusEntry) -> Option<String> {
+    let mut metadata = Vec::with_capacity(5);
+    if status.copied {
+        metadata.push("copied");
+    }
+    if status.switched {
+        metadata.push("switched");
+    }
+    if status.locked {
+        metadata.push("locked");
+    }
+    if status.tree_conflicted {
+        metadata.push("tree conflict");
+    }
+    if status.out_of_date {
+        metadata.push("out of date");
+    }
+    (!metadata.is_empty()).then(|| metadata.join(" · "))
+}
+
+fn source_control_status_color(status: &SourceControlStatusEntry) -> Color {
+    if status.is_conflicted() {
+        return Color::Error;
+    }
+    match status.content_status {
+        SourceControlContentStatus::Conflicted | SourceControlContentStatus::Obstructed => {
+            Color::Error
+        }
+        SourceControlContentStatus::Added | SourceControlContentStatus::Unversioned => {
+            Color::Created
+        }
+        SourceControlContentStatus::Deleted | SourceControlContentStatus::Missing => Color::Deleted,
+        SourceControlContentStatus::Modified | SourceControlContentStatus::Replaced => {
+            Color::Modified
+        }
+        SourceControlContentStatus::Normal
+        | SourceControlContentStatus::Ignored
+        | SourceControlContentStatus::External => Color::Muted,
+    }
+}
+
+fn source_control_ignore_target(path: &SourceControlPath) -> (SourceControlPath, String) {
+    match path.as_str().rsplit_once('/') {
+        Some((directory, pattern)) => (
+            SourceControlPath::new(directory).unwrap_or_else(|_| SourceControlPath::root()),
+            pattern.to_owned(),
+        ),
+        None => (SourceControlPath::root(), path.as_str().to_owned()),
+    }
+}
+
 #[cfg(any(test, feature = "test-support"))]
 impl GitPanel {
     pub fn new_test(
@@ -8244,6 +9960,11 @@ impl GitPanel {
 
 impl Render for GitPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some((snapshot, provider_name)) = self.active_extension_source_control_repository(cx)
+        {
+            return self.render_source_control_panel(snapshot, provider_name, window, cx);
+        }
+
         let project = self.project.read(cx);
         let has_entries = !self.entries.is_empty();
         let has_write_access = self.has_write_access(cx);
@@ -8372,6 +10093,7 @@ impl Render for GitPanel {
                 )
                 .with_priority(1)
             }))
+            .into_any_element()
     }
 }
 
@@ -8454,14 +10176,17 @@ impl Panel for GitPanel {
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
-        Some("Git Panel")
+        Some("Source Control")
     }
 
     fn icon_label(&self, _: &Window, cx: &App) -> Option<String> {
         if !GitPanelSettings::get_global(cx).show_count_badge {
             return None;
         }
-        let total = self.changes_count;
+        let total = self
+            .active_extension_source_control_repository(cx)
+            .map(|(snapshot, _)| snapshot.statuses.len())
+            .unwrap_or(self.changes_count);
         (total > 0).then(|| total.to_string())
     }
 
@@ -9045,6 +10770,124 @@ mod tests {
     }
 
     #[test]
+    fn serializes_active_source_control_repository() -> anyhow::Result<()> {
+        let serialized = SerializedGitPanel {
+            active_source_control_repository: Some(SerializedSourceControlRepository {
+                provider_id: "subversion".to_owned(),
+                repository_id: "uuid:/work/project".to_owned(),
+            }),
+            ..SerializedGitPanel::default()
+        };
+
+        let decoded: SerializedGitPanel =
+            serde_json::from_str(&serde_json::to_string(&serialized)?)?;
+        let repository = decoded
+            .active_source_control_repository
+            .ok_or_else(|| anyhow::anyhow!("active source-control repository was not restored"))?;
+        assert_eq!(repository.provider_id, "subversion");
+        assert_eq!(repository.repository_id, "uuid:/work/project");
+        Ok(())
+    }
+
+    #[test]
+    fn groups_provider_status_and_surfaces_property_conflicts() -> anyhow::Result<()> {
+        let status = |path: &str,
+                      content_status: SourceControlContentStatus,
+                      property_status: SourceControlContentStatus|
+         -> anyhow::Result<SourceControlStatusEntry> {
+            Ok(SourceControlStatusEntry {
+                path: SourceControlPath::new(path)?,
+                node_kind: source_control::SourceControlNodeKind::File,
+                content_status,
+                property_status,
+                selection: SourceControlSelectionEligibility::IncludedByDefault,
+                copied: false,
+                switched: false,
+                locked: false,
+                tree_conflicted: false,
+                out_of_date: false,
+                added_lines: None,
+                deleted_lines: None,
+            })
+        };
+
+        let property_conflict = status(
+            "property.txt",
+            SourceControlContentStatus::Normal,
+            SourceControlContentStatus::Conflicted,
+        )?;
+        assert_eq!(
+            source_control_section(&property_conflict, false),
+            SourceControlSection::Conflicts
+        );
+        assert_eq!(source_control_status_code(&property_conflict), "C");
+        assert_eq!(
+            source_control_status_color(&property_conflict),
+            Color::Error
+        );
+        let diff_capabilities = SourceControlCapabilities {
+            base_text: true,
+            diff: true,
+            ..SourceControlCapabilities::NONE
+        };
+        assert_eq!(
+            source_control_diff_options(&property_conflict, diff_capabilities),
+            (false, true),
+            "property-only changes use the provider details view"
+        );
+
+        let missing = status(
+            "missing.txt",
+            SourceControlContentStatus::Missing,
+            SourceControlContentStatus::Normal,
+        )?;
+        assert_eq!(
+            source_control_section(&missing, false),
+            SourceControlSection::Missing
+        );
+
+        let unversioned = status(
+            "generated/output.txt",
+            SourceControlContentStatus::Unversioned,
+            SourceControlContentStatus::Normal,
+        )?;
+        assert_eq!(
+            source_control_section(&unversioned, false),
+            SourceControlSection::Unversioned
+        );
+        assert_eq!(
+            source_control_ignore_target(&unversioned.path),
+            (
+                SourceControlPath::new("generated")?,
+                "output.txt".to_owned()
+            )
+        );
+
+        let metadata = SourceControlStatusEntry {
+            copied: true,
+            switched: true,
+            locked: true,
+            tree_conflicted: true,
+            out_of_date: true,
+            ..status(
+                "metadata.txt",
+                SourceControlContentStatus::Modified,
+                SourceControlContentStatus::Normal,
+            )?
+        };
+        assert_eq!(
+            source_control_status_metadata(&metadata).as_deref(),
+            Some("copied · switched · locked · tree conflict · out of date")
+        );
+        assert_eq!(
+            source_control_diff_options(&metadata, diff_capabilities),
+            (true, false),
+            "text changes use the integrated editor diff"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_tree_view_directory_expansion_is_scoped_to_section() {
         let entry = |path, status| GitStatusEntry {
             repo_path: repo_path(path),
@@ -9199,6 +11042,288 @@ mod tests {
         await_git_panel_entries(&panel, &mut cx).await;
 
         (fs, project, workspace, panel, cx)
+    }
+
+    #[gpui::test]
+    async fn test_source_control_file_preview(cx: &mut TestAppContext) {
+        async {
+            init_test(cx);
+            let (_, project, workspace, panel, mut cx) = setup_git_panel_with_changes(
+                cx,
+                json!({
+                    ".git": {},
+                    "first.txt": "first",
+                    "second.txt": "second",
+                    "third.txt": "third",
+                }),
+                &[
+                    ("first.txt", StatusCode::Modified),
+                    ("second.txt", StatusCode::Modified),
+                ],
+            )
+            .await;
+            let snapshot = cx
+                .read(|cx| {
+                    project
+                        .read(cx)
+                        .source_control_store()
+                        .read(cx)
+                        .repositories()
+                        .next()
+                        .cloned()
+                })
+                .context("repository should be available")?;
+            workspace.update_in(&mut cx, |workspace, window, cx| {
+                workspace.add_panel(panel.clone(), window, cx);
+                workspace.open_panel::<GitPanel>(window, cx);
+            });
+            let key = &snapshot.repository.key;
+            let mut status = snapshot
+                .statuses
+                .first()
+                .cloned()
+                .context("status should be available")?;
+            status.node_kind = source_control::SourceControlNodeKind::Unknown;
+            status.content_status = SourceControlContentStatus::Unversioned;
+            status.selection = SourceControlSelectionEligibility::RequiresAdd;
+
+            for path in ["first.txt", "second.txt"] {
+                status.path = SourceControlPath::new(path)?;
+                panel.update_in(&mut cx, |panel, window, cx| {
+                    panel.open_source_control_file(key, &status, 1, window, cx);
+                    assert!(!panel.source_control_path_selected(key, &status));
+                });
+                cx.run_until_parked();
+                workspace.update_in(&mut cx, |workspace, window, cx| {
+                    let pane = workspace.active_pane().read(cx);
+                    assert_eq!(pane.items_len(), 1);
+                    assert!(pane.preview_item().is_some());
+                    assert_eq!(
+                        pane.active_item()
+                            .and_then(|item| item.project_path(cx))
+                            .map(|path| path.path),
+                        Some(rel_path(path).into())
+                    );
+                    assert!(panel.read(cx).focus_handle.is_focused(window));
+                });
+            }
+
+            panel.update_in(&mut cx, |panel, window, cx| {
+                panel.open_source_control_file(key, &status, 2, window, cx);
+            });
+            cx.run_until_parked();
+            workspace.update_in(&mut cx, |workspace, window, cx| {
+                let pane = workspace.active_pane().read(cx);
+                assert_eq!(pane.items_len(), 1);
+                assert!(pane.preview_item().is_none());
+                assert!(
+                    pane.active_item().is_some_and(|item| item
+                        .item_focus_handle(cx)
+                        .contains_focused(window, cx))
+                );
+            });
+
+            for (disable_global, path, expected_count) in
+                [(false, "first.txt", 2), (true, "third.txt", 3)]
+            {
+                cx.update(|_, cx| {
+                    SettingsStore::update_global(cx, |store, cx| {
+                        store.update_user_settings(cx, |settings| {
+                            let preview = settings.preview_tabs.get_or_insert_default();
+                            preview.enabled = Some(!disable_global);
+                            preview.enable_preview_from_project_panel = Some(disable_global);
+                        });
+                    });
+                });
+                status.path = SourceControlPath::new(path)?;
+                panel.update_in(&mut cx, |panel, window, cx| {
+                    panel.open_source_control_file(key, &status, 1, window, cx);
+                });
+                cx.run_until_parked();
+                workspace.read_with(&cx, |workspace, cx| {
+                    let pane = workspace.active_pane().read(cx);
+                    assert_eq!(pane.items_len(), expected_count);
+                    assert!(pane.preview_item().is_none());
+                });
+            }
+            anyhow::Ok(())
+        }
+        .await
+        .expect("source-control file test failed");
+    }
+
+    #[gpui::test]
+    async fn test_source_control_file_click_target(cx: &mut TestAppContext) {
+        async {
+            init_test(cx);
+            let (_, project, workspace, panel, mut cx) = setup_git_panel_with_changes(
+                cx,
+                json!({ ".git": {}, "file.txt": "contents" }),
+                &[("file.txt", StatusCode::Modified)],
+            )
+            .await;
+            let snapshot = cx
+                .read(|cx| {
+                    project
+                        .read(cx)
+                        .source_control_store()
+                        .read(cx)
+                        .repositories()
+                        .next()
+                        .cloned()
+                })
+                .context("repository should be available")?;
+            let key = &snapshot.repository.key;
+            let mut status = snapshot
+                .statuses
+                .first()
+                .cloned()
+                .context("status should be available")?;
+            status.selection = SourceControlSelectionEligibility::IncludedByDefault;
+            struct StatusRow {
+                panel: Entity<GitPanel>,
+                workspace: Entity<MultiWorkspace>,
+                key: SourceControlRepositoryKey,
+                status: SourceControlStatusEntry,
+                can_write: bool,
+            }
+            impl Render for StatusRow {
+                fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                    let row = self.panel.update(cx, |panel, cx| {
+                        panel.render_source_control_status(
+                            &self.key,
+                            self.status.clone(),
+                            self.can_write,
+                            SourceControlCapabilities {
+                                commit: true,
+                                ..SourceControlCapabilities::NONE
+                            },
+                            cx,
+                        )
+                    });
+                    v_flex()
+                        .size_full()
+                        .child(row)
+                        .child(self.workspace.clone())
+                }
+            }
+            let root = cx
+                .update(|window, _| window.root::<MultiWorkspace>().flatten())
+                .context("workspace root should be available")?;
+            let row = cx.replace_root_view(|_, _| StatusRow {
+                panel: panel.clone(),
+                workspace: root,
+                key: key.clone(),
+                status: status.clone(),
+                can_write: true,
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let bounds = cx
+                .debug_bounds("source-control-file-file.txt")
+                .context("filename should be rendered")?;
+            cx.simulate_click(
+                gpui::point(px(16.), bounds.center().y),
+                gpui::Modifiers::none(),
+            );
+            panel.read_with(&cx, |panel, _| {
+                assert!(!panel.source_control_path_selected(key, &status))
+            });
+            workspace.read_with(&cx, |workspace, cx| {
+                assert_eq!(workspace.active_pane().read(cx).items_len(), 0)
+            });
+
+            row.update(&mut cx, |row, cx| {
+                row.can_write = false;
+                cx.notify();
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let bounds = cx
+                .debug_bounds("source-control-file-file.txt")
+                .context("filename should be rendered")?;
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+            assert_editor_opened_with_path(&workspace, Path::new("file.txt"), &mut cx);
+            panel.read_with(&cx, |panel, _| {
+                assert!(!panel.source_control_path_selected(key, &status))
+            });
+            anyhow::Ok(())
+        }
+        .await
+        .expect("source-control file test failed");
+    }
+
+    #[gpui::test]
+    async fn test_source_control_file_eligibility(cx: &mut TestAppContext) {
+        async {
+            init_test(cx);
+            let (_, project, workspace, panel, mut cx) = setup_git_panel_with_changes(
+                cx,
+                json!({
+                    ".git": {},
+                    "src": { "file.txt": "contents" },
+                }),
+                &[("src/file.txt", StatusCode::Modified)],
+            )
+            .await;
+            let snapshot = cx
+                .read(|cx| {
+                    project
+                        .read(cx)
+                        .source_control_store()
+                        .read(cx)
+                        .repositories()
+                        .next()
+                        .cloned()
+                })
+                .context("repository should be available")?;
+            let key = &snapshot.repository.key;
+            let mut status = snapshot
+                .statuses
+                .first()
+                .cloned()
+                .context("status should be available")?;
+            status.node_kind = source_control::SourceControlNodeKind::Unknown;
+            panel.read_with(&cx, |panel, cx| -> anyhow::Result<()> {
+                let project_path = panel
+                    .source_control_file_path(key, &status, cx)?
+                    .context("file should be openable")?;
+                assert_eq!(project_path.path.as_ref(), rel_path("src/file.txt"));
+                Ok(())
+            })?;
+
+            for content_status in [
+                SourceControlContentStatus::Missing,
+                SourceControlContentStatus::Deleted,
+            ] {
+                status.content_status = content_status;
+                panel.update_in(&mut cx, |panel, window, cx| {
+                    panel.open_source_control_file(key, &status, 1, window, cx);
+                });
+            }
+            status.content_status = SourceControlContentStatus::Unversioned;
+            status.path = SourceControlPath::new("src")?;
+            panel.update_in(&mut cx, |panel, window, cx| {
+                panel.open_source_control_file(key, &status, 1, window, cx);
+            });
+            cx.run_until_parked();
+            workspace.read_with(&cx, |workspace, cx| {
+                assert_eq!(workspace.active_pane().read(cx).items_len(), 0);
+                assert!(workspace.notification_ids().is_empty());
+            });
+
+            status.path = SourceControlPath::new("unavailable.txt")?;
+            panel.update_in(&mut cx, |panel, window, cx| {
+                panel.open_source_control_file(key, &status, 1, window, cx);
+            });
+            cx.run_until_parked();
+            workspace.read_with(&cx, |workspace, cx| {
+                assert_eq!(workspace.active_pane().read(cx).items_len(), 0);
+                assert!(!workspace.notification_ids().is_empty());
+            });
+            anyhow::Ok(())
+        }
+        .await
+        .expect("source-control file test failed");
     }
 
     #[gpui::test]
@@ -11394,6 +13519,7 @@ mod tests {
             SerializedGitPanel {
                 signoff_enabled: false,
                 commit_messages: panel.serialized_commit_messages(cx),
+                active_source_control_repository: None,
             }
         });
 
@@ -11445,6 +13571,7 @@ mod tests {
                     ..Default::default()
                 },
             )]),
+            active_source_control_repository: None,
         };
         let mismatched_panel = workspace.update_in(cx, |workspace, window, cx| {
             GitPanel::new_with_serialized_panel(

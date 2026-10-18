@@ -43,6 +43,7 @@ pub enum ExtensionProvides {
     LanguageServers,
     DebugAdapters,
     ContextServers,
+    SourceControlProviders,
     /// Deprecated
     AgentServers,
     /// Deprecated

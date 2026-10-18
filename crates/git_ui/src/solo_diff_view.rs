@@ -1,12 +1,13 @@
 use crate::{git_panel::GitStatusEntry, git_panel_settings::GitPanelSettings, git_status_icon};
 use anyhow::{Context as _, Result};
-use buffer_diff::DiffHunkSecondaryStatus;
+use buffer_diff::{BufferDiff, DiffBaseKind, DiffHunkSecondaryStatus};
 use editor::{
     DiffStyleControls, Direction, Editor, EditorEvent, EditorSettings, SplittableEditor,
     ToggleSplitDiff,
     actions::{GoToHunk, GoToPreviousHunk},
     file_status_label_color,
 };
+use futures::{FutureExt as _, select_biased};
 use git::{
     Commit, Restore, StageAndNext, StageFile, ToggleStaged, UnstageAndNext, UnstageFile,
     repository::RepoPath, status::StageStatus,
@@ -15,17 +16,22 @@ use gpui::{
     Action, AnyElement, App, AppContext as _, Context, Empty, Entity, EventEmitter, FocusHandle,
     Focusable, HighlightStyle, IntoElement, Render, Subscription, Task, WeakEntity, Window,
 };
-use language::{Anchor, Buffer, HighlightedText, OffsetRangeExt as _, Point};
+use language::{Anchor, Buffer, Capability, HighlightedText, OffsetRangeExt as _, Point};
 use multi_buffer::{MultiBuffer, PathKey, excerpt_context_lines};
 use project::{
-    Project,
+    Project, ProjectPath,
     git_store::{Repository, RepositoryId},
+    source_control_store::SourceControlRepositorySnapshot,
 };
 use settings::{Settings, SettingsStore, StatusStyle};
+use source_control::{SourceControlPath, SourceControlRepositoryKey};
 use std::{
     any::{Any, TypeId},
     ops::Range,
+    path::{Path, PathBuf},
+    pin::pin,
     sync::Arc,
+    time::Duration,
 };
 use ui::{DiffStat, Divider, Tooltip, prelude::*};
 use util::paths::{PathExt as _, PathStyle};
@@ -37,17 +43,36 @@ use workspace::{
     searchable::SearchableItemHandle,
 };
 
+enum SoloDiffSource {
+    Git {
+        repository: Entity<Repository>,
+        repository_id: RepositoryId,
+        repo_path: RepoPath,
+    },
+    SourceControl {
+        key: SourceControlRepositoryKey,
+        path: SourceControlPath,
+        absolute_path: PathBuf,
+        provider_name: Arc<str>,
+        diff_stat: Option<(u32, u32)>,
+        base_text: Option<Arc<str>>,
+    },
+}
+
 pub struct SoloDiffView {
-    repository: Entity<Repository>,
-    repository_id: RepositoryId,
-    repo_path: RepoPath,
+    source: SoloDiffSource,
     buffer: Entity<Buffer>,
     diff: Entity<buffer_diff::BufferDiff>,
     editor: Entity<SplittableEditor>,
     workspace: WeakEntity<Workspace>,
     showing_full_file: bool,
+    buffer_changes_tx: watch::Sender<()>,
     _settings_subscription: Subscription,
+    _buffer_subscription: Subscription,
+    _recalculate_diff_task: Task<Result<()>>,
 }
+
+const RECALCULATE_DIFF_DEBOUNCE: Duration = Duration::from_millis(250);
 
 impl SoloDiffView {
     pub fn open_or_focus(
@@ -64,7 +89,7 @@ impl SoloDiffView {
         let existing = workspace_entity
             .read(cx)
             .items_of_type::<SoloDiffView>(cx)
-            .find(|item| item.read(cx).matches(&repository, &entry.repo_path, cx));
+            .find(|item| item.read(cx).matches_git(&repository, &entry.repo_path, cx));
         if let Some(existing) = existing {
             workspace_entity.update(cx, |workspace, cx| {
                 workspace.activate_item(&existing, true, true, window, cx);
@@ -99,11 +124,15 @@ impl SoloDiffView {
 
             workspace_entity.update_in(cx, |workspace, window, cx| {
                 let workspace_handle = cx.entity();
+                let repository_id = repository.read(cx).id;
                 let view = cx.new(|cx| {
                     Self::new(
                         project,
-                        repository,
-                        repo_path,
+                        SoloDiffSource::Git {
+                            repository,
+                            repository_id,
+                            repo_path,
+                        },
                         buffer,
                         diff,
                         workspace_handle,
@@ -118,17 +147,129 @@ impl SoloDiffView {
         })
     }
 
+    pub fn open_source_control(
+        repository: SourceControlRepositorySnapshot,
+        path: SourceControlPath,
+        project_path: ProjectPath,
+        provider_name: Arc<str>,
+        workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<Entity<Self>>> {
+        let Some(workspace_entity) = workspace.upgrade() else {
+            return Task::ready(Err(anyhow::anyhow!("workspace was dropped")));
+        };
+
+        let key = repository.repository.key.clone();
+        let existing = workspace_entity
+            .read(cx)
+            .items_of_type::<SoloDiffView>(cx)
+            .find(|item| item.read(cx).matches_source_control(&key, &path));
+        if let Some(existing) = existing {
+            workspace_entity.update(cx, |workspace, cx| {
+                workspace.activate_item(&existing, true, true, window, cx);
+            });
+            existing.focus_handle(cx).focus(window, cx);
+            return Task::ready(Ok(existing));
+        }
+
+        let absolute_path = repository
+            .repository
+            .working_copy_path
+            .join(Path::new(path.as_str()));
+        let diff_stat = repository
+            .statuses
+            .iter()
+            .find(|status| status.path == path)
+            .and_then(|status| match (status.added_lines, status.deleted_lines) {
+                (None, None) => None,
+                (added, deleted) => Some((added.unwrap_or(0), deleted.unwrap_or(0))),
+            });
+        let is_missing = repository.statuses.iter().any(|status| {
+            status.path == path
+                && matches!(
+                    status.content_status,
+                    source_control::SourceControlContentStatus::Deleted
+                        | source_control::SourceControlContentStatus::Missing
+                )
+        });
+        let project = workspace_entity.read(cx).project().clone();
+        let source_control_store = project.read(cx).source_control_store().clone();
+        let base_text_task = source_control_store.update(cx, |store, cx| {
+            store.load_text(&key, path.clone(), None, cx)
+        });
+
+        window.spawn(cx, async move |cx| {
+            let base_text = base_text_task
+                .await?
+                .map(String::from_utf8)
+                .transpose()
+                .with_context(|| format!("{} is not a UTF-8 text file", path.as_str()))?
+                .map(Arc::<str>::from);
+            let buffer_result = project
+                .update(cx, |project, cx| project.open_buffer(project_path, cx))
+                .await;
+            let buffer = match buffer_result {
+                Ok(buffer) => buffer,
+                Err(_) if is_missing => cx.new(|cx| {
+                    let mut buffer = Buffer::local("", cx);
+                    buffer.set_capability(Capability::ReadOnly, cx);
+                    buffer
+                }),
+                Err(error) => return Err(error),
+            };
+            let buffer_snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
+            let language = buffer_snapshot.language().cloned();
+            let language_registry = buffer.read_with(cx, |buffer, _| buffer.language_registry());
+            let diff = cx.new(|cx| {
+                BufferDiff::new(
+                    &buffer_snapshot.text,
+                    language,
+                    language_registry,
+                    DiffBaseKind::Custom,
+                    cx,
+                )
+            });
+            diff.update(cx, |diff, cx| {
+                diff.set_base_text(base_text.clone(), buffer_snapshot.text.clone(), cx)
+            })
+            .await;
+
+            workspace_entity.update_in(cx, |workspace, window, cx| {
+                let workspace_handle = cx.entity();
+                let view = cx.new(|cx| {
+                    Self::new(
+                        project,
+                        SoloDiffSource::SourceControl {
+                            key,
+                            path,
+                            absolute_path,
+                            provider_name,
+                            diff_stat,
+                            base_text,
+                        },
+                        buffer,
+                        diff,
+                        workspace_handle,
+                        window,
+                        cx,
+                    )
+                });
+                workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+                view
+            })
+        })
+    }
+
     fn new(
         project: Entity<Project>,
-        repository: Entity<Repository>,
-        repo_path: RepoPath,
+        source: SoloDiffSource,
         buffer: Entity<Buffer>,
         diff: Entity<buffer_diff::BufferDiff>,
         workspace: Entity<Workspace>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let repository_id = repository.read(cx).id;
         let showing_full_file = EditorSettings::get_global(cx).file_diff.show_full_file;
         let multibuffer = cx
             .new(|cx| Self::build_multibuffer(buffer.clone(), diff.clone(), showing_full_file, cx));
@@ -171,17 +312,70 @@ impl SoloDiffView {
                     cx.notify();
                 }
             });
+        let (buffer_changes_tx, mut buffer_changes_rx) = watch::channel(());
+        let buffer_subscription = cx.subscribe(&buffer, |this, buffer, event, cx| match event {
+            language::BufferEvent::LanguageChanged(_) => {
+                if matches!(&this.source, SoloDiffSource::SourceControl { .. }) {
+                    let language = buffer.read(cx).language().cloned();
+                    let base_text_buffer = this.diff.read(cx).base_text_buffer().clone();
+                    base_text_buffer.update(cx, |base_buffer, cx| {
+                        base_buffer.set_language_async(language, cx)
+                    });
+                    this.buffer_changes_tx.send(()).ok();
+                }
+            }
+            language::BufferEvent::Edited { .. } | language::BufferEvent::Reloaded
+                if matches!(&this.source, SoloDiffSource::SourceControl { .. }) =>
+            {
+                this.buffer_changes_tx.send(()).ok();
+            }
+            _ => {}
+        });
+        let diff_for_updates = diff.clone();
 
         Self {
-            repository,
-            repository_id,
-            repo_path,
+            source,
             buffer,
             diff,
             editor,
             workspace: workspace.downgrade(),
             showing_full_file,
+            buffer_changes_tx,
             _settings_subscription: settings_subscription,
+            _buffer_subscription: buffer_subscription,
+            _recalculate_diff_task: cx.spawn(async move |this, cx| {
+                while buffer_changes_rx.recv().await.is_ok() {
+                    loop {
+                        let mut timer = cx
+                            .background_executor()
+                            .timer(RECALCULATE_DIFF_DEBOUNCE)
+                            .fuse();
+                        let mut recv = pin!(buffer_changes_rx.recv().fuse());
+                        select_biased! {
+                            _ = timer => break,
+                            _ = recv => continue,
+                        }
+                    }
+
+                    let Some((base_text, buffer_snapshot)) =
+                        this.update(cx, |this, cx| match &this.source {
+                            SoloDiffSource::SourceControl { base_text, .. } => {
+                                Some((base_text.clone(), this.buffer.read(cx).snapshot()))
+                            }
+                            SoloDiffSource::Git { .. } => None,
+                        })?
+                    else {
+                        continue;
+                    };
+                    diff_for_updates
+                        .update(cx, |diff, cx| {
+                            diff.set_base_text(base_text, buffer_snapshot.text, cx)
+                        })
+                        .await;
+                    this.update(cx, |this, cx| this.refresh_excerpts(cx))?;
+                }
+                Ok(())
+            }),
         }
     }
 
@@ -238,9 +432,15 @@ impl SoloDiffView {
             return;
         }
 
-        let (ranges, context_line_count) =
-            Self::excerpt_ranges(&self.buffer, &self.diff, showing_full_file, cx);
+        self.showing_full_file = showing_full_file;
+        self.refresh_excerpts(cx);
+        cx.notify();
+    }
 
+    fn refresh_excerpts(&mut self, cx: &mut Context<Self>) {
+        let (ranges, context_line_count) =
+            Self::excerpt_ranges(&self.buffer, &self.diff, self.showing_full_file, cx);
+        let showing_full_file = self.showing_full_file;
         self.editor.update(cx, |editor, cx| {
             let path = PathKey::for_buffer(&self.buffer, cx);
             editor.remove_excerpts_for_path(path.clone(), cx);
@@ -256,13 +456,52 @@ impl SoloDiffView {
                 editor.set_allow_git_diff_scrollbar_markers(showing_full_file, cx);
             });
         });
-
-        self.showing_full_file = showing_full_file;
-        cx.notify();
     }
 
-    fn matches(&self, repository: &Entity<Repository>, repo_path: &RepoPath, cx: &App) -> bool {
-        self.repository_id == repository.read(cx).id && &self.repo_path == repo_path
+    fn matches_git(&self, repository: &Entity<Repository>, repo_path: &RepoPath, cx: &App) -> bool {
+        matches!(
+            &self.source,
+            SoloDiffSource::Git {
+                repository_id,
+                repo_path: current_path,
+                ..
+            } if *repository_id == repository.read(cx).id && current_path == repo_path
+        )
+    }
+
+    fn matches_source_control(
+        &self,
+        key: &SourceControlRepositoryKey,
+        path: &SourceControlPath,
+    ) -> bool {
+        matches!(
+            &self.source,
+            SoloDiffSource::SourceControl {
+                key: current_key,
+                path: current_path,
+                ..
+            } if current_key == key && current_path == path
+        )
+    }
+
+    fn git_source(&self) -> Option<(&Entity<Repository>, &RepoPath)> {
+        match &self.source {
+            SoloDiffSource::Git {
+                repository,
+                repo_path,
+                ..
+            } => Some((repository, repo_path)),
+            SoloDiffSource::SourceControl { .. } => None,
+        }
+    }
+
+    fn display_path(&self) -> String {
+        match &self.source {
+            SoloDiffSource::Git { repo_path, .. } => {
+                repo_path.as_ref().display(PathStyle::local()).into_owned()
+            }
+            SoloDiffSource::SourceControl { path, .. } => path.as_str().to_owned(),
+        }
     }
 
     fn button_states(&self, cx: &App) -> SoloDiffButtonStates {
@@ -311,10 +550,13 @@ impl SoloDiffView {
         }
 
         let stage_status = self
-            .repository
-            .read(cx)
-            .status_for_path(&self.repo_path)
-            .map(|entry| entry.status.staging())
+            .git_source()
+            .and_then(|(repository, repo_path)| {
+                repository
+                    .read(cx)
+                    .status_for_path(repo_path)
+                    .map(|entry| entry.status.staging())
+            })
             .unwrap_or(StageStatus::Unstaged);
 
         SoloDiffButtonStates {
@@ -337,8 +579,11 @@ impl SoloDiffView {
     }
 
     fn change_file_stage(&self, stage: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let repository = self.repository.clone();
-        let repo_path = self.repo_path.clone();
+        let Some((repository, repo_path)) = self.git_source() else {
+            return;
+        };
+        let repository = repository.clone();
+        let repo_path = repo_path.clone();
         let workspace = self.workspace.clone();
         let task = cx.spawn(async move |_, cx| {
             repository
@@ -400,10 +645,11 @@ impl Item for SoloDiffView {
                 )
             })
             .unwrap_or_else(|| {
-                self.repo_path
-                    .as_ref()
-                    .display(PathStyle::local())
-                    .into_owned()
+                let path = self.display_path();
+                Path::new(&path)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or(path)
             })
             .into()
     }
@@ -414,11 +660,11 @@ impl Item for SoloDiffView {
                 .read(cx)
                 .file()
                 .map(|file| file.full_path(cx).compact().to_string_lossy().into_owned())
-                .unwrap_or_else(|| {
-                    self.repo_path
-                        .as_ref()
-                        .display(PathStyle::local())
-                        .into_owned()
+                .unwrap_or_else(|| match &self.source {
+                    SoloDiffSource::Git { .. } => self.display_path(),
+                    SoloDiffSource::SourceControl { absolute_path, .. } => {
+                        absolute_path.compact().to_string_lossy().into_owned()
+                    }
                 })
                 .into(),
         )
@@ -494,22 +740,25 @@ impl Item for SoloDiffView {
     }
 
     fn breadcrumbs(&self, cx: &App) -> Option<(Vec<HighlightedText>, Option<gpui::Font>)> {
-        let text: SharedString = self
-            .repo_path
-            .as_ref()
-            .display(PathStyle::local())
-            .into_owned()
-            .into();
+        let text: SharedString = match &self.source {
+            SoloDiffSource::Git { .. } => self.display_path().into(),
+            SoloDiffSource::SourceControl {
+                provider_name,
+                path,
+                ..
+            } => format!("{provider_name} · {}", path.as_str()).into(),
+        };
 
         // When the git panel is set to convey status via label color rather
         // than an icon, tint the whole path like multibuffer headers do.
         let mut highlights = Vec::new();
         if GitPanelSettings::get_global(cx).status_style == StatusStyle::LabelColor
-            && let Some(status) = self
-                .repository
-                .read(cx)
-                .status_for_path(&self.repo_path)
-                .map(|entry| entry.status)
+            && let Some(status) = self.git_source().and_then(|(repository, repo_path)| {
+                repository
+                    .read(cx)
+                    .status_for_path(repo_path)
+                    .map(|entry| entry.status)
+            })
         {
             highlights.push((
                 0..text.len(),
@@ -618,11 +867,12 @@ impl Render for SoloDiffStyleToolbar {
             (
                 solo_diff.editor.clone(),
                 solo_diff.showing_full_file,
-                solo_diff
-                    .repository
-                    .read(cx)
-                    .status_for_path(&solo_diff.repo_path)
-                    .map(|entry| entry.status),
+                solo_diff.git_source().and_then(|(repository, repo_path)| {
+                    repository
+                        .read(cx)
+                        .status_for_path(repo_path)
+                        .map(|entry| entry.status)
+                }),
             )
         };
 
@@ -759,6 +1009,25 @@ mod tests {
         assert_eq!(buffer_count, 1);
         assert!(has_expand_controls);
     }
+
+    #[gpui::test]
+    fn test_deleted_file_diff_keeps_base_only_hunk(cx: &mut TestAppContext) {
+        let buffer = cx.new(|cx| Buffer::local("", cx));
+        let diff = cx.new(|cx| {
+            buffer_diff::BufferDiff::new_with_base_text(
+                "deleted line\n",
+                &buffer.read(cx).text_snapshot(),
+                cx,
+            )
+        });
+        let multibuffer = cx.new(|cx| SoloDiffView::build_multibuffer(buffer, diff, false, cx));
+
+        let hunk_count = multibuffer.update(cx, |multibuffer, cx| {
+            multibuffer.snapshot(cx).diff_hunks().count()
+        });
+
+        assert_eq!(hunk_count, 1);
+    }
 }
 
 impl Render for SoloDiffGitToolbar {
@@ -770,10 +1039,52 @@ impl Render for SoloDiffGitToolbar {
         let focus_handle = solo_diff.focus_handle(cx);
         let solo_diff = solo_diff.read(cx);
         let button_states = solo_diff.button_states(cx);
+        if let SoloDiffSource::SourceControl { diff_stat, .. } = &solo_diff.source {
+            return h_flex()
+                .my_neg_1()
+                .py_1()
+                .gap_1p5()
+                .flex_wrap()
+                .justify_between()
+                .children(diff_stat.map(|(added, deleted)| {
+                    DiffStat::new("solo-diff-stat", added as usize, deleted as usize)
+                }))
+                .child(Divider::vertical().ml_1())
+                .child(
+                    h_group_sm()
+                        .child(
+                            IconButton::new("up", IconName::ArrowUp)
+                                .icon_size(IconSize::Small)
+                                .disabled(!button_states.prev_next)
+                                .tooltip(Tooltip::for_action_title_in(
+                                    "Go to Previous Hunk",
+                                    &GoToPreviousHunk,
+                                    &focus_handle,
+                                ))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.dispatch_action(&GoToPreviousHunk, window, cx)
+                                })),
+                        )
+                        .child(
+                            IconButton::new("down", IconName::ArrowDown)
+                                .icon_size(IconSize::Small)
+                                .disabled(!button_states.prev_next)
+                                .tooltip(Tooltip::for_action_title_in(
+                                    "Go to Next Hunk",
+                                    &GoToHunk,
+                                    &focus_handle,
+                                ))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.dispatch_action(&GoToHunk, window, cx)
+                                })),
+                        ),
+                )
+                .into_any_element();
+        }
+
         let status_entry = solo_diff
-            .repository
-            .read(cx)
-            .status_for_path(&solo_diff.repo_path);
+            .git_source()
+            .and_then(|(repository, repo_path)| repository.read(cx).status_for_path(repo_path));
         let diff_stat = status_entry.and_then(|entry| entry.diff_stat);
 
         h_flex()

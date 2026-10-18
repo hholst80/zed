@@ -68,6 +68,7 @@ mod edit_prediction;
 mod input;
 mod markdown_actions;
 mod navigation;
+mod revision_blame;
 mod rewrap;
 mod selection;
 
@@ -126,6 +127,7 @@ pub use multi_buffer::{
     MultiBufferOffset, MultiBufferOffsetUtf16, MultiBufferSnapshot, PathKey, RowInfo, ToOffset,
     ToPoint,
 };
+pub use revision_blame::RevisionBlameEntry;
 pub use split::{DiffStyleControls, SplittableEditor, ToggleSplitDiff};
 pub use split_editor_view::SplitEditorView;
 pub use text::Bias;
@@ -224,6 +226,7 @@ use project::{
 };
 use rand::seq::SliceRandom;
 use regex::Regex;
+use revision_blame::RevisionBlame;
 use rpc::{ErrorCode, ErrorExt, proto::PeerId};
 use scroll::{Autoscroll, ScrollAnchor, ScrollManager, SharedScrollAnchor};
 use selections_collection::{MutableSelectionsCollection, SelectionsCollection};
@@ -1078,6 +1081,7 @@ pub struct Editor {
     buffer_serialization: Option<BufferSerialization>,
     show_selection_menu: Option<bool>,
     blame: Option<Entity<GitBlame>>,
+    revision_blame: Option<Entity<RevisionBlame>>,
     blame_subscription: Option<Subscription>,
     pending_blame_hover_observation: Option<Subscription>,
     custom_context_menu: Option<
@@ -1214,7 +1218,7 @@ pub struct EditorSnapshot {
     show_runnables: Option<bool>,
     show_breakpoints: Option<bool>,
     show_bookmarks: Option<bool>,
-    git_blame_gutter_max_author_length: Option<usize>,
+    blame_gutter_content: Option<BlameGutterContent>,
     pub display_snapshot: DisplaySnapshot,
     pub placeholder_display_snapshot: Option<DisplaySnapshot>,
     is_focused: bool,
@@ -1246,6 +1250,12 @@ pub struct GutterDimensions {
     pub width: Pixels,
     pub margin: Pixels,
     pub git_blame_entries_width: Option<Pixels>,
+}
+
+#[derive(Clone, Copy)]
+enum BlameGutterContent {
+    Git { max_author_length: usize },
+    Revision { max_author_length: usize },
 }
 
 impl GutterDimensions {
@@ -2408,6 +2418,7 @@ impl Editor {
                 )
             }),
             blame: None,
+            revision_blame: None,
             blame_subscription: None,
             pending_blame_hover_observation: None,
 
@@ -2963,6 +2974,40 @@ impl Editor {
         self.workspace.as_ref()?.0.upgrade()
     }
 
+    /// Shows provider-neutral revision blame in the editor gutter.
+    ///
+    /// The one-based line numbers in `entries` refer to `reference_text`, which
+    /// is aligned with the live buffer. Local editor changes are left unannotated.
+    pub fn set_revision_blame(
+        &mut self,
+        reference_text: SharedString,
+        entries: Vec<RevisionBlameEntry>,
+        cx: &mut Context<Self>,
+    ) {
+        let blame =
+            cx.new(|cx| RevisionBlame::new(self.buffer.clone(), reference_text, entries, cx));
+        self.show_git_blame_gutter = false;
+        self.show_git_blame_inline = false;
+        self.revision_blame = Some(blame);
+        cx.notify();
+    }
+
+    pub fn clear_revision_blame(&mut self, cx: &mut Context<Self>) {
+        if self.revision_blame.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn render_revision_blame_gutter(&self, cx: &mut App) -> bool {
+        if self.mode().is_minimap() {
+            return false;
+        }
+        let Some(blame) = self.revision_blame.as_ref() else {
+            return false;
+        };
+        blame.update(cx, |blame, cx| blame.has_entries(cx))
+    }
+
     /// Detaches a task and shows an error notification in the workspace if available,
     /// otherwise just logs the error.
     pub fn detach_and_notify_err<R, E>(
@@ -2994,18 +3039,19 @@ impl Editor {
     }
 
     pub fn snapshot(&self, window: &Window, cx: &mut App) -> EditorSnapshot {
-        let git_blame_gutter_max_author_length = self
-            .render_git_blame_gutter(cx)
-            .then(|| {
-                if let Some(blame) = self.blame.as_ref() {
-                    let max_author_length =
-                        blame.update(cx, |blame, cx| blame.max_author_length(cx));
-                    Some(max_author_length)
-                } else {
-                    None
-                }
+        let blame_gutter_content = if self.render_revision_blame_gutter(cx) {
+            self.revision_blame.as_ref().map(|blame| {
+                let max_author_length = blame.update(cx, |blame, cx| blame.max_author_length(cx));
+                BlameGutterContent::Revision { max_author_length }
             })
-            .flatten();
+        } else if self.render_git_blame_gutter(cx) {
+            self.blame.as_ref().map(|blame| {
+                let max_author_length = blame.update(cx, |blame, cx| blame.max_author_length(cx));
+                BlameGutterContent::Git { max_author_length }
+            })
+        } else {
+            None
+        };
 
         let display_snapshot = self.display_map.update(cx, |map, cx| map.snapshot(cx));
 
@@ -3021,7 +3067,7 @@ impl Editor {
             show_runnables: self.show_runnables,
             show_bookmarks: self.show_bookmarks,
             show_breakpoints: self.show_breakpoints,
-            git_blame_gutter_max_author_length,
+            blame_gutter_content,
             scroll_anchor: self.scroll_manager.shared_scroll_anchor(cx),
             display_snapshot,
             placeholder_display_snapshot: self
@@ -11716,19 +11762,30 @@ impl EditorSnapshot {
             let show_breakpoints = self.show_breakpoints.unwrap_or(gutter_settings.breakpoints);
             let show_bookmarks = self.show_bookmarks.unwrap_or(gutter_settings.bookmarks);
 
-            let git_blame_entries_width =
-                self.git_blame_gutter_max_author_length
-                    .map(|max_author_length| {
-                        let renderer = cx.global::<GlobalBlameRenderer>().0.clone();
-                        const MAX_RELATIVE_TIMESTAMP: &str = "2 years, 11 months ago";
+            let git_blame_entries_width = self.blame_gutter_content.map(|content| match content {
+                BlameGutterContent::Git { max_author_length } => {
+                    let renderer = cx.global::<GlobalBlameRenderer>().0.clone();
+                    const MAX_RELATIVE_TIMESTAMP: &str = "2 years, 11 months ago";
 
-                        let max_char_count = max_author_length.min(renderer.max_author_length())
-                            + ::git::SHORT_SHA_LENGTH
-                            + MAX_RELATIVE_TIMESTAMP.len();
+                    let max_char_count = max_author_length.min(renderer.max_author_length())
+                        + ::git::SHORT_SHA_LENGTH
+                        + MAX_RELATIVE_TIMESTAMP.len();
 
-                        ch_advance * max_char_count
-                            + renderer.blame_entry_non_text_width(window, cx)
-                    });
+                    ch_advance * max_char_count + renderer.blame_entry_non_text_width(window, cx)
+                }
+                BlameGutterContent::Revision { max_author_length } => {
+                    const MAX_AUTHOR_LENGTH: usize = 20;
+                    const MAX_REVISION_LENGTH: usize = 12;
+                    const COMPACT_TIMESTAMP_LENGTH: usize = 10;
+                    const SEPARATOR_LENGTH: usize = 6;
+
+                    ch_advance
+                        * (max_author_length.min(MAX_AUTHOR_LENGTH)
+                            + MAX_REVISION_LENGTH
+                            + COMPACT_TIMESTAMP_LENGTH
+                            + SEPARATOR_LENGTH)
+                }
+            });
 
             let is_singleton = self.buffer_snapshot().is_singleton();
 

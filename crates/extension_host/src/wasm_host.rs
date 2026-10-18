@@ -527,6 +527,296 @@ impl extension::Extension for WasmExtension {
         })
         .await?
     }
+
+    async fn source_control_discover(
+        &self,
+        provider_id: source_control::SourceControlProviderId,
+        worktree: Arc<dyn WorktreeDelegate>,
+    ) -> std::result::Result<
+        Vec<source_control::SourceControlRepository>,
+        source_control::SourceControlError,
+    > {
+        let worktree_id = worktree.id();
+        let worktree_root = PathBuf::from(worktree.root_path());
+        let provider_id_for_call = provider_id.clone();
+        self.call(move |extension, store| {
+            async move {
+                let host = store.data().host.clone();
+                let resource = store
+                    .data_mut()
+                    .table
+                    .push(worktree)
+                    .map_err(source_control_transport_error)?;
+                let repositories = extension
+                    .call_source_control_discover(store, provider_id_for_call.as_str(), resource)
+                    .await
+                    .map_err(source_control_transport_error)?
+                    .map_err(wit::source_control_error_from_wit)?;
+                let canonical_worktree_root = host
+                    .fs
+                    .canonicalize(&worktree_root)
+                    .await
+                    .map_err(source_control_transport_error)?;
+                let mut validated_repositories = Vec::with_capacity(repositories.len());
+                for repository in repositories {
+                    let repository = wit::source_control_repository_from_wit(
+                        repository,
+                        provider_id.clone(),
+                        worktree_id,
+                    )?;
+                    let canonical_working_copy = host
+                        .fs
+                        .canonicalize(&repository.working_copy_path)
+                        .await
+                        .map_err(source_control_transport_error)?;
+                    if !canonical_working_copy.starts_with(&canonical_worktree_root)
+                        && !canonical_worktree_root.starts_with(&canonical_working_copy)
+                    {
+                        return Err(source_control::SourceControlError::new(
+                            source_control::SourceControlErrorKind::MalformedResponse,
+                            "a source-control provider returned a working copy unrelated to its worktree",
+                        ));
+                    }
+                    validated_repositories.push(repository);
+                }
+                Ok(validated_repositories)
+            }
+            .boxed()
+        })
+        .await
+        .map_err(source_control_transport_error)?
+    }
+
+    async fn source_control_status(
+        &self,
+        provider_id: source_control::SourceControlProviderId,
+        repository_id: source_control::SourceControlRepositoryId,
+        worktree: Arc<dyn WorktreeDelegate>,
+    ) -> std::result::Result<
+        Vec<source_control::SourceControlStatusEntry>,
+        source_control::SourceControlError,
+    > {
+        self.call(|extension, store| {
+            async move {
+                let resource = store
+                    .data_mut()
+                    .table
+                    .push(worktree)
+                    .map_err(source_control_transport_error)?;
+                extension
+                    .call_source_control_status(
+                        store,
+                        provider_id.as_str(),
+                        repository_id.as_str(),
+                        resource,
+                    )
+                    .await
+                    .map_err(source_control_transport_error)?
+                    .map_err(wit::source_control_error_from_wit)?
+                    .into_iter()
+                    .map(wit::source_control_status_from_wit)
+                    .collect()
+            }
+            .boxed()
+        })
+        .await
+        .map_err(source_control_transport_error)?
+    }
+
+    async fn source_control_load_text(
+        &self,
+        provider_id: source_control::SourceControlProviderId,
+        repository_id: source_control::SourceControlRepositoryId,
+        path: source_control::SourceControlPath,
+        revision: Option<source_control::SourceControlRevision>,
+        worktree: Arc<dyn WorktreeDelegate>,
+    ) -> std::result::Result<Option<Vec<u8>>, source_control::SourceControlError> {
+        self.call(|extension, store| {
+            async move {
+                let resource = store
+                    .data_mut()
+                    .table
+                    .push(worktree)
+                    .map_err(source_control_transport_error)?;
+                let revision = revision.map(wit::source_control_revision_to_wit);
+                extension
+                    .call_source_control_load_text(
+                        store,
+                        provider_id.as_str(),
+                        repository_id.as_str(),
+                        path.as_str(),
+                        revision.as_ref(),
+                        resource,
+                    )
+                    .await
+                    .map_err(source_control_transport_error)?
+                    .map_err(wit::source_control_error_from_wit)
+            }
+            .boxed()
+        })
+        .await
+        .map_err(source_control_transport_error)?
+    }
+
+    async fn source_control_diff(
+        &self,
+        provider_id: source_control::SourceControlProviderId,
+        repository_id: source_control::SourceControlRepositoryId,
+        path: source_control::SourceControlPath,
+        worktree: Arc<dyn WorktreeDelegate>,
+    ) -> std::result::Result<Option<Arc<str>>, source_control::SourceControlError> {
+        self.call(|extension, store| {
+            async move {
+                let resource = store
+                    .data_mut()
+                    .table
+                    .push(worktree)
+                    .map_err(source_control_transport_error)?;
+                extension
+                    .call_source_control_diff(
+                        store,
+                        provider_id.as_str(),
+                        repository_id.as_str(),
+                        path.as_str(),
+                        resource,
+                    )
+                    .await
+                    .map_err(source_control_transport_error)?
+                    .map(|diff| diff.map(Arc::from))
+                    .map_err(wit::source_control_error_from_wit)
+            }
+            .boxed()
+        })
+        .await
+        .map_err(source_control_transport_error)?
+    }
+
+    async fn source_control_history(
+        &self,
+        provider_id: source_control::SourceControlProviderId,
+        repository_id: source_control::SourceControlRepositoryId,
+        path: Option<source_control::SourceControlPath>,
+        limit: usize,
+        worktree: Arc<dyn WorktreeDelegate>,
+    ) -> std::result::Result<
+        Vec<source_control::SourceControlHistoryEntry>,
+        source_control::SourceControlError,
+    > {
+        self.call(move |extension, store| {
+            async move {
+                let resource = store
+                    .data_mut()
+                    .table
+                    .push(worktree)
+                    .map_err(source_control_transport_error)?;
+                extension
+                    .call_source_control_history(
+                        store,
+                        provider_id.as_str(),
+                        repository_id.as_str(),
+                        path.as_ref().map(|path| path.as_str()),
+                        limit.min(u32::MAX as usize) as u32,
+                        resource,
+                    )
+                    .await
+                    .map_err(source_control_transport_error)?
+                    .map_err(wit::source_control_error_from_wit)?
+                    .into_iter()
+                    .map(wit::source_control_history_from_wit)
+                    .collect()
+            }
+            .boxed()
+        })
+        .await
+        .map_err(source_control_transport_error)?
+    }
+
+    async fn source_control_blame(
+        &self,
+        provider_id: source_control::SourceControlProviderId,
+        repository_id: source_control::SourceControlRepositoryId,
+        path: source_control::SourceControlPath,
+        worktree: Arc<dyn WorktreeDelegate>,
+    ) -> std::result::Result<
+        Vec<source_control::SourceControlBlameLine>,
+        source_control::SourceControlError,
+    > {
+        self.call(|extension, store| {
+            async move {
+                let resource = store
+                    .data_mut()
+                    .table
+                    .push(worktree)
+                    .map_err(source_control_transport_error)?;
+                Ok(extension
+                    .call_source_control_blame(
+                        store,
+                        provider_id.as_str(),
+                        repository_id.as_str(),
+                        path.as_str(),
+                        resource,
+                    )
+                    .await
+                    .map_err(source_control_transport_error)?
+                    .map_err(wit::source_control_error_from_wit)?
+                    .into_iter()
+                    .map(wit::source_control_blame_from_wit)
+                    .collect())
+            }
+            .boxed()
+        })
+        .await
+        .map_err(source_control_transport_error)?
+    }
+
+    async fn source_control_execute(
+        &self,
+        provider_id: source_control::SourceControlProviderId,
+        repository_id: source_control::SourceControlRepositoryId,
+        operation: source_control::SourceControlOperation,
+        options: source_control::SourceControlExecutionOptions,
+        worktree: Arc<dyn WorktreeDelegate>,
+    ) -> std::result::Result<
+        source_control::SourceControlOperationOutput,
+        source_control::SourceControlError,
+    > {
+        let operation = wit::source_control_operation_to_wit(operation)?;
+        let options = wit::source_control_execution_options_to_wit(options);
+        self.call(|extension, store| {
+            async move {
+                let resource = store
+                    .data_mut()
+                    .table
+                    .push(worktree)
+                    .map_err(source_control_transport_error)?;
+                let output = extension
+                    .call_source_control_execute(
+                        store,
+                        provider_id.as_str(),
+                        repository_id.as_str(),
+                        &operation,
+                        &options,
+                        resource,
+                    )
+                    .await
+                    .map_err(source_control_transport_error)?
+                    .map_err(wit::source_control_error_from_wit)?;
+                Ok(wit::source_control_operation_output_from_wit(output))
+            }
+            .boxed()
+        })
+        .await
+        .map_err(source_control_transport_error)?
+    }
+}
+
+fn source_control_transport_error(
+    error: impl std::fmt::Display,
+) -> source_control::SourceControlError {
+    source_control::SourceControlError::new(
+        source_control::SourceControlErrorKind::TransportFailure,
+        error.to_string(),
+    )
 }
 
 pub struct WasmState {
