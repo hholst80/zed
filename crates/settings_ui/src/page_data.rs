@@ -8448,6 +8448,22 @@ fn ai_page(cx: &App) -> SettingsPage {
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
+                title: "Compact Tool Calls",
+                description: "Group consecutive tool calls and thinking blocks into an expandable summary. Approvals and failed calls remain visible.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.compact_tool_calls"),
+                    pick: |settings_content| {
+                        settings_content.agent.as_ref()?.compact_tool_calls.as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content.agent.get_or_insert_default().compact_tool_calls = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
                 title: "Expand Terminal Card",
                 description: "Whether to have terminal cards in the agent panel expanded, showing the whole command output.",
                 field: Box::new(SettingField {

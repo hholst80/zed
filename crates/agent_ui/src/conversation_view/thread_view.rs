@@ -48,6 +48,7 @@ use ui::{
 use util::markdown::{source_position_from_fragment, split_local_url_fragment};
 use workspace::{OpenOptions, SERIALIZATION_THROTTLE_TIME};
 
+use super::compact_tool_calls::{ActivityKind, ThreadRow, row_for_entry, thread_rows};
 use super::elicitation::{
     ElicitationCard, ElicitationCardHandlers, ElicitationFormState, should_render_elicitation,
 };
@@ -590,6 +591,9 @@ pub struct ThreadView {
     pub last_token_limit_telemetry: Option<acp_thread::TokenUsageRatio>,
     thread_feedback: ThreadFeedbackState,
     pub list_state: ListState,
+    entry_rows: Vec<ThreadRow>,
+    row_focus_handles: Vec<Option<FocusHandle>>,
+    expanded_activity_groups: HashSet<usize>,
     pub session_capabilities: SharedSessionCapabilities,
     pub expanded_tool_call_raw_inputs: HashSet<acp::ToolCallId>,
     collapsed_sandbox_authorization_details: HashSet<acp::ToolCallId>,
@@ -979,6 +983,11 @@ impl ThreadView {
             }));
         }));
 
+        subscriptions.push(cx.observe_global::<SettingsStore>(|this, cx| {
+            this.sync_entry_rows(cx);
+            cx.notify();
+        }));
+
         let mut this = Self {
             root_thread_id,
             session_id,
@@ -999,6 +1008,9 @@ impl ThreadView {
             model_selector,
             profile_selector,
             list_state,
+            entry_rows: Vec::new(),
+            row_focus_handles: Vec::new(),
+            expanded_activity_groups: HashSet::default(),
             session_capabilities,
             resumed_without_history,
             _subscriptions: subscriptions,
@@ -1053,6 +1065,10 @@ impl ThreadView {
         };
 
         this.sync_generating_indicator(cx);
+        if let Some(mut position) = this.thread.read(cx).ui_scroll_position() {
+            position.item_ix = this.row_for_entry(position.item_ix);
+            this.list_state.scroll_to(position);
+        }
         this.sync_editor_mode(cx);
         this.sync_existing_elicitation_states(window, cx);
         let list_state_for_scroll = this.list_state.clone();
@@ -1066,8 +1082,9 @@ impl ThreadView {
                 // ListState's RefCell is mutably borrowed. Reading logical_scroll_top()
                 // directly would panic from a double borrow.
                 cx.defer(move |cx| {
-                    let scroll_top = list_state.logical_scroll_top();
+                    let mut scroll_top = list_state.logical_scroll_top();
                     let _ = thread_view.update(cx, |this, cx| {
+                        scroll_top.item_ix = this.entry_for_row(scroll_top.item_ix);
                         if let Some(thread) = this.as_native_thread(cx) {
                             thread.update(cx, |thread, _cx| {
                                 thread.set_ui_scroll_position(Some(scroll_top));
@@ -3541,7 +3558,7 @@ impl ThreadView {
                                 )
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.list_state.scroll_to(ListOffset {
-                                        item_ix: entry_ix,
+                                        item_ix: this.row_for_entry(entry_ix),
                                         offset_in_item: px(0.0),
                                     });
                                     cx.notify();
@@ -3570,9 +3587,15 @@ impl ThreadView {
         let thread = self.thread.read(cx);
         let (entry_ix, tool_call) = thread.tool_call(&tool_call_id)?;
 
-        let scroll_icon = if self.list_state.item_is_above_viewport(entry_ix)? {
+        let scroll_icon = if self
+            .list_state
+            .item_is_above_viewport(self.row_for_entry(entry_ix))?
+        {
             IconName::ArrowUp
-        } else if self.list_state.item_is_below_viewport(entry_ix)? {
+        } else if self
+            .list_state
+            .item_is_below_viewport(self.row_for_entry(entry_ix))?
+        {
             IconName::ArrowDown
         } else {
             return None;
@@ -3625,7 +3648,7 @@ impl ThreadView {
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.list_state.scroll_to(ListOffset {
-                            item_ix: entry_ix,
+                            item_ix: this.row_for_entry(entry_ix),
                             offset_in_item: px(0.0),
                         });
                         cx.notify();
@@ -4073,7 +4096,8 @@ impl ThreadView {
         self.entry_view_state.update(cx, |state, _cx| {
             state.toggle_compaction_expansion(entry_ix);
         });
-        self.list_state.remeasure_items(entry_ix..entry_ix + 1);
+        let row = self.row_for_entry(entry_ix);
+        self.list_state.remeasure_items(row..row + 1);
         self.refresh_thread_search(window, cx);
         cx.notify();
     }
@@ -6084,6 +6108,282 @@ fn sandbox_network_rows(network: &SandboxNetPolicy) -> Vec<SandboxRow> {
 }
 
 impl ThreadView {
+    pub(crate) fn row_for_entry(&self, entry: usize) -> usize {
+        row_for_entry(&self.entry_rows, entry)
+    }
+
+    fn entry_for_row(&self, row: usize) -> usize {
+        self.entry_rows
+            .get(row)
+            .map(ThreadRow::first_entry)
+            .unwrap_or_else(|| self.thread_entry_count())
+    }
+
+    fn thread_entry_count(&self) -> usize {
+        self.entry_rows
+            .last()
+            .map(|row| match row {
+                ThreadRow::Entry(index) => index + 1,
+                ThreadRow::Activity { entries, .. } => entries.end,
+            })
+            .unwrap_or(0)
+    }
+
+    fn sync_entry_rows(&mut self, cx: &App) {
+        let thread = self.thread.read(cx);
+        let kinds = thread
+            .entries()
+            .iter()
+            .map(|entry| ActivityKind::for_entry(entry, cx))
+            .collect::<Vec<_>>();
+        let rows = thread_rows(
+            &kinds,
+            AgentSettings::get_global(cx).compact_tool_calls,
+            &self.expanded_activity_groups,
+        );
+        let generating =
+            matches!(thread.status(), ThreadStatus::Generating) && !thread.is_compacting();
+        let scroll = self.list_state.logical_scroll_top();
+        let anchor = if self.entry_rows.is_empty() {
+            scroll.item_ix
+        } else {
+            self.entry_for_row(scroll.item_ix)
+        };
+        let following = self.list_state.is_following_tail();
+
+        let mut old_items = self
+            .entry_rows
+            .iter()
+            .cloned()
+            .map(Some)
+            .collect::<Vec<_>>();
+        if self.generating_indicator_in_list {
+            old_items.push(None);
+        }
+        let mut new_items = rows.iter().cloned().map(Some).collect::<Vec<_>>();
+        if generating {
+            new_items.push(None);
+        }
+        let old_items = old_items
+            .into_iter()
+            .zip(self.row_focus_handles.iter().cloned())
+            .collect::<Vec<_>>();
+        // Status events can precede initialization of a new entry's view state.
+        let state = self.entry_view_state.read(cx);
+        let new_items = new_items
+            .into_iter()
+            .map(|row| {
+                let handle = row
+                    .as_ref()
+                    .and_then(|row| state.entry(row.first_entry())?.focus_handle(cx));
+                (row, handle)
+            })
+            .collect::<Vec<_>>();
+        let prefix = old_items
+            .iter()
+            .zip(&new_items)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let suffix = old_items[prefix..]
+            .iter()
+            .rev()
+            .zip(new_items[prefix..].iter().rev())
+            .take_while(|(a, b)| a == b)
+            .count();
+
+        // During construction the list already contains the ungrouped entries.
+        let old_end = if self.entry_rows.is_empty() && !self.generating_indicator_in_list {
+            self.list_state.item_count()
+        } else {
+            old_items.len() - suffix
+        };
+        let new_end = new_items.len() - suffix;
+        let changed = old_end != prefix || new_end != prefix;
+        if changed {
+            self.list_state.splice_focusable(
+                prefix..old_end,
+                new_items[prefix..new_end]
+                    .iter()
+                    .map(|(_, handle)| handle.clone()),
+            );
+        }
+        self.entry_rows = rows;
+        self.row_focus_handles = new_items.iter().map(|(_, handle)| handle.clone()).collect();
+        self.generating_indicator_in_list = generating;
+        if changed && !following && !new_items.is_empty() {
+            self.list_state.scroll_to(ListOffset {
+                item_ix: self.row_for_entry(anchor).min(new_items.len() - 1),
+                offset_in_item: scroll.offset_in_item,
+            });
+        }
+    }
+
+    pub(crate) fn activity_entries_removed(&mut self, removed: &std::ops::Range<usize>) {
+        self.expanded_activity_groups = self
+            .expanded_activity_groups
+            .iter()
+            .filter_map(|index| {
+                if *index < removed.start {
+                    Some(*index)
+                } else if *index >= removed.end {
+                    Some(index - removed.len())
+                } else {
+                    None
+                }
+            })
+            .collect();
+    }
+
+    fn reveal_activity_entry(&mut self, entry: usize, cx: &mut App) {
+        if let Some(ThreadRow::Activity {
+            entries,
+            expanded: false,
+        }) = self.entry_rows.get(self.row_for_entry(entry))
+        {
+            self.expanded_activity_groups.insert(entries.start);
+            self.sync_entry_rows(cx);
+        }
+        let call_id = if AgentSettings::get_global(cx).compact_tool_calls {
+            match self.thread.read(cx).entries().get(entry) {
+                Some(AgentThreadEntry::ToolCall(call)) if call.kind == acp::ToolKind::Execute => {
+                    Some(call.id.clone())
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(id) = call_id {
+            self.entry_view_state.update(cx, |state, _| {
+                state.expand_tool_call(id);
+            });
+            let row = self.row_for_entry(entry);
+            self.list_state.remeasure_items(row..row + 1);
+        }
+    }
+
+    fn render_activity_group(
+        &self,
+        entries: std::ops::Range<usize>,
+        expanded: bool,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let thread = self.thread.read(cx);
+        let mut counts = [0usize; 6];
+        let mut running = false;
+        for index in entries.clone() {
+            let Some(entry) = thread.entries().get(index) else {
+                continue;
+            };
+            if let Some(kind) = ActivityKind::for_entry(entry, cx) {
+                counts[kind as usize] += match entry {
+                    AgentThreadEntry::AssistantMessage(message) => message.chunks.len(),
+                    _ => 1,
+                };
+            }
+            running |= matches!(entry, AgentThreadEntry::ToolCall(call)
+                if matches!(call.status, ToolCallStatus::Pending | ToolCallStatus::InProgress));
+        }
+        running |= matches!(thread.status(), ThreadStatus::Generating)
+            && entries.end == thread.entries().len();
+        let labels = [
+            ("thinking block", "thinking blocks"),
+            ("read", "reads"),
+            ("search", "searches"),
+            ("command", "commands"),
+            ("edit", "edits"),
+            ("other tool", "other tools"),
+        ];
+        let summary = counts
+            .iter()
+            .zip(labels)
+            .filter(|(count, _)| **count > 0)
+            .map(|(count, (singular, plural))| {
+                format!("{count} {}", if *count == 1 { singular } else { plural })
+            })
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let start = entries.start;
+        let handle = self
+            .entry_view_state
+            .read(cx)
+            .entry(start)
+            .and_then(|entry| entry.focus_handle(cx));
+        let header = h_flex()
+            .id(("activity-group", start))
+            .when(!expanded, |this| {
+                this.when_some(handle, |this, handle| this.track_focus(&handle))
+            })
+            .w_full()
+            .px_5()
+            .py_1p5()
+            .gap_2()
+            .cursor_pointer()
+            .hover(|style| style.bg(cx.theme().colors().element_hover))
+            .child(Disclosure::new(
+                ("activity-group-disclosure", start),
+                expanded,
+            ))
+            .when(running, |this| {
+                this.child(GeneratingSpinnerElement::new(SpinnerVariant::Sand))
+            })
+            .child(
+                Label::new(summary)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .truncate(),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.toggle_activity_group(start, window, cx);
+            }))
+            .on_key_down(
+                cx.listener(move |this, event: &gpui::KeyDownEvent, window, cx| {
+                    if !expanded && matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                        this.toggle_activity_group(start, window, cx);
+                        cx.stop_propagation();
+                    }
+                }),
+            );
+        v_flex()
+            .w_full()
+            .child(header)
+            .when(expanded, |this| {
+                this.when_some(thread.entries().get(start), |this, entry| {
+                    this.child(self.render_entry(start, thread.entries().len(), entry, window, cx))
+                })
+            })
+            .when(!expanded && entries.end == thread.entries().len(), |this| {
+                let last_assistant = thread
+                    .entries()
+                    .iter()
+                    .rposition(|entry| matches!(entry, AgentThreadEntry::AssistantMessage(_)));
+                this.child(self.render_thread_controls(
+                    &self.thread,
+                    entries.end - 1,
+                    last_assistant,
+                    true,
+                    None,
+                    cx,
+                ))
+                .when_some(
+                    self.thread_feedback.comments_editor.clone(),
+                    |this, editor| this.child(Self::render_feedback_feedback_editor(editor, cx)),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn toggle_activity_group(&mut self, start: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.list_state.pause_following_tail();
+        if !self.expanded_activity_groups.remove(&start) {
+            self.expanded_activity_groups.insert(start);
+        }
+        self.sync_entry_rows(cx);
+        self.refresh_thread_search(window, cx);
+        cx.notify();
+    }
+
     fn render_entries(&mut self, cx: &mut Context<Self>) -> List {
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
         let centered_container = move |content: AnyElement| {
@@ -6099,8 +6399,18 @@ impl ThreadView {
             self.list_state.clone(),
             cx.processor(move |this, index: usize, window, cx| {
                 let entries = this.thread.read(cx).entries();
-                if let Some(entry) = entries.get(index) {
-                    let rendered = this.render_entry(index, entries.len(), entry, window, cx);
+                if let Some(row) = this.entry_rows.get(index) {
+                    let rendered = match row {
+                        ThreadRow::Entry(entry_ix) => entries
+                            .get(*entry_ix)
+                            .map(|entry| {
+                                this.render_entry(*entry_ix, entries.len(), entry, window, cx)
+                            })
+                            .unwrap_or_else(|| Empty.into_any()),
+                        ThreadRow::Activity { entries, expanded } => {
+                            this.render_activity_group(entries.clone(), *expanded, window, cx)
+                        }
+                    };
                     centered_container(rendered.into_any_element()).into_any_element()
                 } else if this.generating_indicator_in_list {
                     let confirmation = this.thread.read(cx).is_waiting_for_confirmation()
@@ -7010,7 +7320,7 @@ impl ThreadView {
                 .rposition(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
         }) {
             self.list_state.scroll_to(ListOffset {
-                item_ix: ix,
+                item_ix: self.row_for_entry(ix),
                 offset_in_item: px(0.0),
             });
             cx.notify();
@@ -7113,13 +7423,13 @@ impl ThreadView {
         cx: &mut Context<Self>,
     ) {
         let entries = self.thread.read(cx).entries();
-        let current_ix = self.list_state.logical_scroll_top().item_ix;
+        let current_ix = self.entry_for_row(self.list_state.logical_scroll_top().item_ix);
         if let Some(target_ix) = (0..current_ix)
             .rev()
             .find(|&i| matches!(entries.get(i), Some(AgentThreadEntry::UserMessage(_))))
         {
             self.list_state.scroll_to(ListOffset {
-                item_ix: target_ix,
+                item_ix: self.row_for_entry(target_ix),
                 offset_in_item: px(0.),
             });
             cx.notify();
@@ -7133,12 +7443,12 @@ impl ThreadView {
         cx: &mut Context<Self>,
     ) {
         let entries = self.thread.read(cx).entries();
-        let current_ix = self.list_state.logical_scroll_top().item_ix;
+        let current_ix = self.entry_for_row(self.list_state.logical_scroll_top().item_ix);
         if let Some(target_ix) = (current_ix + 1..entries.len())
             .find(|&i| matches!(entries.get(i), Some(AgentThreadEntry::UserMessage(_))))
         {
             self.list_state.scroll_to(ListOffset {
-                item_ix: target_ix,
+                item_ix: self.row_for_entry(target_ix),
                 offset_in_item: px(0.),
             });
             cx.notify();
@@ -7191,8 +7501,9 @@ impl ThreadView {
                     let view = view.clone();
                     cx.defer(move |cx| {
                         view.update(cx, |this, cx| {
+                            this.reveal_activity_entry(entry_ix, cx);
                             this.list_state.scroll_to(gpui::ListOffset {
-                                item_ix: entry_ix,
+                                item_ix: this.row_for_entry(entry_ix),
                                 offset_in_item: gpui::px(0.),
                             });
                             cx.notify();
@@ -7292,22 +7603,8 @@ impl ThreadView {
         });
     }
 
-    /// Ensures the list item count includes (or excludes) an extra item for the generating indicator
     pub(crate) fn sync_generating_indicator(&mut self, cx: &App) {
-        let thread = self.thread.read(cx);
-
-        let is_generating =
-            matches!(thread.status(), ThreadStatus::Generating) && !thread.is_compacting();
-
-        if is_generating && !self.generating_indicator_in_list {
-            let entries_count = self.thread.read(cx).entries().len();
-            self.list_state.splice(entries_count..entries_count, 1);
-            self.generating_indicator_in_list = true;
-        } else if !is_generating && self.generating_indicator_in_list {
-            let entries_count = self.thread.read(cx).entries().len();
-            self.list_state.splice(entries_count..entries_count + 1, 0);
-            self.generating_indicator_in_list = false;
-        }
+        self.sync_entry_rows(cx);
     }
 
     fn render_generating(&self, confirmation: bool, cx: &App) -> impl IntoElement {
@@ -7756,6 +8053,7 @@ impl ThreadView {
         &self,
         group: SharedString,
         is_preview: bool,
+        collapsed: Option<acp::ToolCallId>,
         command: Entity<Markdown>,
         window: &Window,
         cx: &Context<Self>,
@@ -7768,6 +8066,40 @@ impl ThreadView {
             .and_then(|s| s.strip_suffix("\n```"))
             .unwrap_or(&command_source)
             .to_string();
+
+        if let Some(id) = collapsed {
+            let first_line = command_text.lines().next().unwrap_or_default().to_string();
+            let remaining_lines = command_text.lines().count().saturating_sub(1);
+            return div().p_1p5().bg(self.tool_card_header_bg(cx)).child(
+                h_flex()
+                    .id(group)
+                    .w_full()
+                    .gap_2()
+                    .cursor_pointer()
+                    .child(
+                        div().min_w_0().flex_1().child(
+                            Label::new(first_line)
+                                .buffer_font(cx)
+                                .size(LabelSize::Small)
+                                .truncate(),
+                        ),
+                    )
+                    .when(remaining_lines > 0, |this| {
+                        this.child(
+                            Label::new(format!("+{remaining_lines} lines"))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.entry_view_state.update(cx, |state, _| {
+                            state.expand_tool_call(id.clone());
+                        });
+                        this.refresh_thread_search(window, cx);
+                        cx.notify();
+                    })),
+            );
+        }
 
         let mut style =
             MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_agent_buffer_font(cx);
@@ -7878,6 +8210,13 @@ impl ThreadView {
         let command_element = self.render_collapsible_command(
             header_group.clone(),
             false,
+            (AgentSettings::get_global(cx).compact_tool_calls
+                && !needs_confirmation
+                && !self
+                    .entry_view_state
+                    .read(cx)
+                    .is_tool_call_expanded(&tool_call.id))
+            .then(|| tool_call.id.clone()),
             tool_call.label.clone(),
             window,
             cx,
@@ -8460,10 +8799,24 @@ impl ThreadView {
                     this.child(self.render_collapsible_command(
                         card_header_id.clone(),
                         true,
+                        (AgentSettings::get_global(cx).compact_tool_calls && !is_open)
+                            .then(|| tool_call.id.clone()),
                         tool_call.label.clone(),
                         window,
                         cx,
-                    ))
+                    )).when(AgentSettings::get_global(cx).compact_tool_calls && is_open && !needs_confirmation, |this| {
+                        let id = tool_call.id.clone();
+                        this.child(IconButton::new(("collapse-command", entry_ix), IconName::ChevronUp)
+                            .full_width()
+                            .tooltip(Tooltip::text("Collapse Command"))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.entry_view_state.update(cx, |state, _| {
+                                    state.collapse_tool_call(&id);
+                                });
+                                this.refresh_thread_search(window, cx);
+                                cx.notify();
+                            })))
+                    })
                 } else {
                     this.child(
                         h_flex()

@@ -311,6 +311,10 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub expand_terminal_card: Option<bool>,
+    /// Group consecutive tool calls and thinking blocks into an expandable summary.
+    ///
+    /// Default: false
+    pub compact_tool_calls: Option<bool>,
     /// Command to automatically run when Zed creates a Terminal Thread shell in the agent panel.
     /// The command is sent to the shell as if typed, so it is interpreted by your
     /// configured shell (including on Windows and remote/WSL projects).
