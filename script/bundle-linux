@@ -137,11 +137,11 @@ cargo --config .cargo/bundle-config.toml build --release --target "${target_trip
 # Build remote_server in separate invocation to prevent feature unification from other crates
 # from influencing dynamic libraries required by it.
 if "$build_remote_server"; then
-if [[ "$remote_server_triple" == "$musl_triple" ]]; then
-    musl_cc_var="CC_$(echo "$remote_server_triple" | tr '-' '_')"
-    export "$musl_cc_var"=musl-gcc
-fi
-cargo --config .cargo/bundle-config.toml build --release --target "${remote_server_triple}" --package remote_server
+    if [[ "$remote_server_triple" == "$musl_triple" ]]; then
+        musl_cc_var="CC_$(echo "$remote_server_triple" | tr '-' '_')"
+        export "$musl_cc_var"=musl-gcc
+    fi
+    cargo --config .cargo/bundle-config.toml build --release --target "${remote_server_triple}" --package remote_server
 fi
 
 if ! "$skip_sentry"; then

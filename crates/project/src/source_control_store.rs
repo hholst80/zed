@@ -1543,7 +1543,7 @@ fn node_kind_to_proto(kind: SourceControlNodeKind) -> proto::SourceControlNodeKi
 }
 
 fn node_kind_from_proto(value: i32) -> Result<SourceControlNodeKind, SourceControlError> {
-    match proto::SourceControlNodeKind::from_i32(value).ok_or_else(|| malformed_enum(value))? {
+    match proto::SourceControlNodeKind::try_from(value).map_err(|_| malformed_enum(value))? {
         proto::SourceControlNodeKind::File => Ok(SourceControlNodeKind::File),
         proto::SourceControlNodeKind::Directory => Ok(SourceControlNodeKind::Directory),
         proto::SourceControlNodeKind::SymbolicLink => Ok(SourceControlNodeKind::SymbolicLink),
@@ -1570,7 +1570,7 @@ fn content_status_to_proto(
 }
 
 fn content_status_from_proto(value: i32) -> Result<SourceControlContentStatus, SourceControlError> {
-    match proto::SourceControlContentStatus::from_i32(value).ok_or_else(|| malformed_enum(value))? {
+    match proto::SourceControlContentStatus::try_from(value).map_err(|_| malformed_enum(value))? {
         proto::SourceControlContentStatus::Normal => Ok(SourceControlContentStatus::Normal),
         proto::SourceControlContentStatus::Modified => Ok(SourceControlContentStatus::Modified),
         proto::SourceControlContentStatus::Added => Ok(SourceControlContentStatus::Added),
@@ -1612,8 +1612,8 @@ fn selection_to_proto(
 fn selection_from_proto(
     value: i32,
 ) -> Result<SourceControlSelectionEligibility, SourceControlError> {
-    match proto::SourceControlSelectionEligibility::from_i32(value)
-        .ok_or_else(|| malformed_enum(value))?
+    match proto::SourceControlSelectionEligibility::try_from(value)
+        .map_err(|_| malformed_enum(value))?
     {
         proto::SourceControlSelectionEligibility::IncludedByDefault => {
             Ok(SourceControlSelectionEligibility::IncludedByDefault)
@@ -1988,14 +1988,14 @@ fn error_to_proto(error: &SourceControlError) -> proto::SourceControlError {
 }
 
 fn error_from_proto(error: proto::SourceControlError) -> SourceControlError {
-    let kind = match proto::SourceControlErrorKind::from_i32(error.kind) {
-        Some(proto::SourceControlErrorKind::ProviderUnavailable) => {
+    let kind = match proto::SourceControlErrorKind::try_from(error.kind) {
+        Ok(proto::SourceControlErrorKind::ProviderUnavailable) => {
             SourceControlErrorKind::ProviderUnavailable
         }
-        Some(proto::SourceControlErrorKind::RepositoryNotFound) => {
+        Ok(proto::SourceControlErrorKind::RepositoryNotFound) => {
             SourceControlErrorKind::RepositoryNotFound
         }
-        Some(proto::SourceControlErrorKind::UnsupportedOperation) => {
+        Ok(proto::SourceControlErrorKind::UnsupportedOperation) => {
             let Some(capability) = error.capability.as_deref().and_then(capability_from_wire)
             else {
                 return SourceControlError::new(
@@ -2005,40 +2005,34 @@ fn error_from_proto(error: proto::SourceControlError) -> SourceControlError {
             };
             SourceControlErrorKind::UnsupportedOperation { capability }
         }
-        Some(proto::SourceControlErrorKind::AuthenticationRequired) => {
+        Ok(proto::SourceControlErrorKind::AuthenticationRequired) => {
             SourceControlErrorKind::AuthenticationRequired {
                 realm: Arc::from(error.realm.unwrap_or_else(|| "unknown realm".to_owned())),
                 username: error.username.map(Arc::from),
             }
         }
-        Some(proto::SourceControlErrorKind::TrustRequired) => {
-            SourceControlErrorKind::TrustRequired {
-                realm: Arc::from(error.realm.unwrap_or_else(|| "unknown realm".to_owned())),
-                fingerprint: Arc::from(
-                    error
-                        .fingerprint
-                        .unwrap_or_else(|| "unknown fingerprint".to_owned()),
-                ),
-                failures: error.trust_failures.into_iter().map(Arc::from).collect(),
-            }
-        }
-        Some(proto::SourceControlErrorKind::Cancelled) => SourceControlErrorKind::Cancelled,
-        Some(proto::SourceControlErrorKind::StaleState) => SourceControlErrorKind::StaleState,
-        Some(proto::SourceControlErrorKind::CommandFailed) => {
-            SourceControlErrorKind::CommandFailed {
-                exit_code: error.exit_code,
-            }
-        }
-        Some(proto::SourceControlErrorKind::MalformedResponse) => {
+        Ok(proto::SourceControlErrorKind::TrustRequired) => SourceControlErrorKind::TrustRequired {
+            realm: Arc::from(error.realm.unwrap_or_else(|| "unknown realm".to_owned())),
+            fingerprint: Arc::from(
+                error
+                    .fingerprint
+                    .unwrap_or_else(|| "unknown fingerprint".to_owned()),
+            ),
+            failures: error.trust_failures.into_iter().map(Arc::from).collect(),
+        },
+        Ok(proto::SourceControlErrorKind::Cancelled) => SourceControlErrorKind::Cancelled,
+        Ok(proto::SourceControlErrorKind::StaleState) => SourceControlErrorKind::StaleState,
+        Ok(proto::SourceControlErrorKind::CommandFailed) => SourceControlErrorKind::CommandFailed {
+            exit_code: error.exit_code,
+        },
+        Ok(proto::SourceControlErrorKind::MalformedResponse) => {
             SourceControlErrorKind::MalformedResponse
         }
-        Some(proto::SourceControlErrorKind::TransportFailure) => {
+        Ok(proto::SourceControlErrorKind::TransportFailure) => {
             SourceControlErrorKind::TransportFailure
         }
-        Some(proto::SourceControlErrorKind::InvalidRequest) => {
-            SourceControlErrorKind::InvalidRequest
-        }
-        None => SourceControlErrorKind::MalformedResponse,
+        Ok(proto::SourceControlErrorKind::InvalidRequest) => SourceControlErrorKind::InvalidRequest,
+        Err(_) => SourceControlErrorKind::MalformedResponse,
     };
     SourceControlError::new(kind, error.message)
 }

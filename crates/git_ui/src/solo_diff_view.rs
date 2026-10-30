@@ -1,6 +1,6 @@
 use crate::{git_panel::GitStatusEntry, git_panel_settings::GitPanelSettings, git_status_icon};
 use anyhow::{Context as _, Result};
-use buffer_diff::{BufferDiff, DiffBaseKind, DiffHunkSecondaryStatus};
+use buffer_diff::{BufferDiff, DiffHunkSecondaryStatus};
 use editor::{
     DiffStyleControls, Direction, Editor, EditorEvent, EditorSettings, SplittableEditor,
     ToggleSplitDiff,
@@ -221,15 +221,8 @@ impl SoloDiffView {
             let buffer_snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
             let language = buffer_snapshot.language().cloned();
             let language_registry = buffer.read_with(cx, |buffer, _| buffer.language_registry());
-            let diff = cx.new(|cx| {
-                BufferDiff::new(
-                    &buffer_snapshot.text,
-                    language,
-                    language_registry,
-                    DiffBaseKind::Custom,
-                    cx,
-                )
-            });
+            let diff = cx
+                .new(|cx| BufferDiff::new(&buffer_snapshot.text, language, language_registry, cx));
             diff.update(cx, |diff, cx| {
                 diff.set_base_text(base_text.clone(), buffer_snapshot.text.clone(), cx)
             })

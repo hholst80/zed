@@ -1299,14 +1299,17 @@ impl Extension {
         store: &mut Store<WasmState>,
         provider_id: &str,
         resource: Resource<Arc<dyn WorktreeDelegate>>,
-    ) -> Result<Result<Vec<source_control::Repository>, source_control::ProviderError>> {
+    ) -> wasmtime::Result<Result<Vec<source_control::Repository>, source_control::ProviderError>>
+    {
         match self {
             Extension::V0_8_0(extension) => {
                 extension
                     .call_source_control_discover(store, provider_id, resource)
                     .await
             }
-            _ => anyhow::bail!("source-control providers require extension API 0.8"),
+            _ => Err(wasmtime::Error::msg(
+                "source-control providers require extension API 0.8",
+            )),
         }
     }
 
@@ -1316,14 +1319,17 @@ impl Extension {
         provider_id: &str,
         repository_id: &str,
         resource: Resource<Arc<dyn WorktreeDelegate>>,
-    ) -> Result<Result<Vec<source_control::StatusEntry>, source_control::ProviderError>> {
+    ) -> wasmtime::Result<Result<Vec<source_control::StatusEntry>, source_control::ProviderError>>
+    {
         match self {
             Extension::V0_8_0(extension) => {
                 extension
                     .call_source_control_status(store, provider_id, repository_id, resource)
                     .await
             }
-            _ => anyhow::bail!("source-control providers require extension API 0.8"),
+            _ => Err(wasmtime::Error::msg(
+                "source-control providers require extension API 0.8",
+            )),
         }
     }
 
@@ -1335,7 +1341,7 @@ impl Extension {
         path: &str,
         revision: Option<&source_control::Revision>,
         resource: Resource<Arc<dyn WorktreeDelegate>>,
-    ) -> Result<Result<Option<Vec<u8>>, source_control::ProviderError>> {
+    ) -> wasmtime::Result<Result<Option<Vec<u8>>, source_control::ProviderError>> {
         match self {
             Extension::V0_8_0(extension) => {
                 extension
@@ -1349,7 +1355,9 @@ impl Extension {
                     )
                     .await
             }
-            _ => anyhow::bail!("source-control providers require extension API 0.8"),
+            _ => Err(wasmtime::Error::msg(
+                "source-control providers require extension API 0.8",
+            )),
         }
     }
 
@@ -1360,14 +1368,16 @@ impl Extension {
         repository_id: &str,
         path: &str,
         resource: Resource<Arc<dyn WorktreeDelegate>>,
-    ) -> Result<Result<Option<String>, source_control::ProviderError>> {
+    ) -> wasmtime::Result<Result<Option<String>, source_control::ProviderError>> {
         match self {
             Extension::V0_8_0(extension) => {
                 extension
                     .call_source_control_diff(store, provider_id, repository_id, path, resource)
                     .await
             }
-            _ => anyhow::bail!("source-control providers require extension API 0.8"),
+            _ => Err(wasmtime::Error::msg(
+                "source-control providers require extension API 0.8",
+            )),
         }
     }
 
@@ -1379,7 +1389,8 @@ impl Extension {
         path: Option<&str>,
         limit: u32,
         resource: Resource<Arc<dyn WorktreeDelegate>>,
-    ) -> Result<Result<Vec<source_control::HistoryEntry>, source_control::ProviderError>> {
+    ) -> wasmtime::Result<Result<Vec<source_control::HistoryEntry>, source_control::ProviderError>>
+    {
         match self {
             Extension::V0_8_0(extension) => {
                 extension
@@ -1393,7 +1404,9 @@ impl Extension {
                     )
                     .await
             }
-            _ => anyhow::bail!("source-control providers require extension API 0.8"),
+            _ => Err(wasmtime::Error::msg(
+                "source-control providers require extension API 0.8",
+            )),
         }
     }
 
@@ -1404,14 +1417,17 @@ impl Extension {
         repository_id: &str,
         path: &str,
         resource: Resource<Arc<dyn WorktreeDelegate>>,
-    ) -> Result<Result<Vec<source_control::BlameLine>, source_control::ProviderError>> {
+    ) -> wasmtime::Result<Result<Vec<source_control::BlameLine>, source_control::ProviderError>>
+    {
         match self {
             Extension::V0_8_0(extension) => {
                 extension
                     .call_source_control_blame(store, provider_id, repository_id, path, resource)
                     .await
             }
-            _ => anyhow::bail!("source-control providers require extension API 0.8"),
+            _ => Err(wasmtime::Error::msg(
+                "source-control providers require extension API 0.8",
+            )),
         }
     }
 
@@ -1423,7 +1439,8 @@ impl Extension {
         operation: &source_control::Operation,
         options: &source_control::ExecutionOptions,
         resource: Resource<Arc<dyn WorktreeDelegate>>,
-    ) -> Result<Result<source_control::OperationOutput, source_control::ProviderError>> {
+    ) -> wasmtime::Result<Result<source_control::OperationOutput, source_control::ProviderError>>
+    {
         match self {
             Extension::V0_8_0(extension) => {
                 extension
@@ -1437,7 +1454,9 @@ impl Extension {
                     )
                     .await
             }
-            _ => anyhow::bail!("source-control providers require extension API 0.8"),
+            _ => Err(wasmtime::Error::msg(
+                "source-control providers require extension API 0.8",
+            )),
         }
     }
 }

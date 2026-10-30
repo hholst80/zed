@@ -10070,7 +10070,7 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut askpass = self.askpass_delegate(request.name, window, cx);
+        let askpass = self.askpass_delegate(request.name, window, cx);
         cx.spawn_in(window, async move |this, cx| {
             let username = if let Some(username) = suggested_username {
                 username.to_string()
