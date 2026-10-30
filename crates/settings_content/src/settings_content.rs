@@ -172,6 +172,11 @@ pub enum ReduceMotionMode {
 #[with_fallible_options]
 #[derive(Debug, PartialEq, Default, Clone, Serialize, JsonSchema, MergeFrom)]
 pub struct SettingsContent {
+    /// Allow running Zed as root on Unix. Read only from user settings at startup.
+    /// Can also be enabled with the ZED_ALLOW_ROOT=true environment variable.
+    /// Default: false
+    pub allow_root: Option<bool>,
+
     #[serde(flatten)]
     pub project: ProjectSettingsContent,
 
@@ -406,7 +411,7 @@ fallible_options::flattened_deserialize!(SettingsContent {
     sections: { project, theme, extension, workspace, editor, remote },
     options: {
         call_hierarchy, command_palette, file_finder, git_panel, tabs, tab_bar, tab_switcher, status_bar, preview_tabs, agent,
-        agent_servers, audio, auto_update, base_keymap, collaboration_panel, debugger, diagnostics,
+        agent_servers, allow_root, audio, auto_update, base_keymap, collaboration_panel, debugger, diagnostics,
         git,
         global_lsp_settings, image_viewer, markdown_preview, repl, helix_mode, hide_mouse,
         journal, log, line_indicator_format, language_models, copilot, outline_panel, project_panel,

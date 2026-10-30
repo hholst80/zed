@@ -482,9 +482,6 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    #[cfg(unix)]
-    util::prevent_root_execution();
-
     // Exit flatpak sandbox if needed
     #[cfg(target_os = "linux")]
     {
@@ -512,16 +509,19 @@ fn run() -> Result<()> {
 
     let args = Args::parse();
 
-    // `zed --askpass` Makes zed operate in nc/netcat mode for use with askpass
-    if let Some(socket) = &args.askpass {
-        askpass::main(socket);
-        return Ok(());
-    }
-
     // Set custom data directory before any path operations
     let user_data_dir = args.user_data_dir.clone();
     if let Some(dir) = &user_data_dir {
         paths::set_custom_data_dir(dir);
+    }
+
+    #[cfg(unix)]
+    util::prevent_root_execution(paths::settings_file());
+
+    // `zed --askpass` Makes zed operate in nc/netcat mode for use with askpass
+    if let Some(socket) = &args.askpass {
+        askpass::main(socket);
+        return Ok(());
     }
 
     #[cfg(target_os = "linux")]
