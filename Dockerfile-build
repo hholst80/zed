@@ -1,0 +1,78 @@
+# syntax=docker/dockerfile:1.7
+
+ARG BASE_IMAGE=ubuntu:24.04
+FROM ${BASE_IMAGE} AS development
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG TZ=Etc/UTC
+
+ENV TZ=${TZ} \
+    RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:${PATH} \
+    CARGO_TERM_COLOR=always \
+    RUST_BACKTRACE=1
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# Keep the system dependency list aligned with Zed's canonical Linux setup.
+COPY script/linux /tmp/zed-build/script/linux
+RUN chmod +x /tmp/zed-build/script/linux \
+    && /tmp/zed-build/script/linux \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        file \
+        openssh-client \
+        subversion \
+        sudo \
+    && rm -rf /var/lib/apt/lists/* /tmp/zed-build
+
+# Installing from the checked-in toolchain file pins Rust, components, and
+# targets, including wasm32-wasip2 for extension builds.
+COPY rust-toolchain.toml /tmp/zed-toolchain/rust-toolchain.toml
+WORKDIR /tmp/zed-toolchain
+ARG CARGO_ABOUT_VERSION=0.8.2
+RUN rustup show active-toolchain \
+    && cargo --version \
+    && rustc --version \
+    && cargo install --locked "cargo-about@${CARGO_ABOUT_VERSION}" \
+    && cargo about --version \
+    && svn --version --quiet
+
+ARG USERNAME=zed
+ARG USER_UID=1000
+ARG USER_GID=1000
+
+RUN set -eux; \
+    existing_user="$(getent passwd "${USER_UID}" | cut -d: -f1 || true)"; \
+    if [[ -n "${existing_user}" && "${existing_user}" != "${USERNAME}" ]]; then \
+        userdel --remove "${existing_user}" 2>/dev/null || userdel "${existing_user}"; \
+    fi; \
+    existing_group="$(getent group "${USER_GID}" | cut -d: -f1 || true)"; \
+    if [[ -z "${existing_group}" ]]; then \
+        groupadd --gid "${USER_GID}" "${USERNAME}"; \
+    fi; \
+    if ! id "${USERNAME}" >/dev/null 2>&1; then \
+        useradd --create-home --shell /bin/bash --uid "${USER_UID}" --gid "${USER_GID}" "${USERNAME}"; \
+    fi; \
+    mkdir -p \
+        "/home/${USERNAME}/.cargo/git" \
+        "/home/${USERNAME}/.cargo/registry" \
+        /workspace/zed; \
+    chown -R "${USERNAME}:${USER_GID}" \
+        "/home/${USERNAME}" \
+        /workspace; \
+    printf '%s ALL=(ALL) NOPASSWD: ALL\n' "${USERNAME}" > "/etc/sudoers.d/${USERNAME}"; \
+    chmod 0440 "/etc/sudoers.d/${USERNAME}"
+
+ENV HOME=/home/${USERNAME} \
+    CARGO_HOME=/home/${USERNAME}/.cargo \
+    CARGO_TARGET_DIR=/workspace/zed/target/container \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PATH=/usr/local/cargo/bin:/home/${USERNAME}/.cargo/bin:${PATH}
+
+USER ${USERNAME}
+WORKDIR /workspace/zed
+
+CMD ["/bin/bash"]

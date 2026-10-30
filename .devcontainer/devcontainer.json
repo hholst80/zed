@@ -1,0 +1,26 @@
+{
+  "name": "Zed Subversion Build",
+  "build": {
+    "dockerfile": "../Dockerfile-build",
+    "context": "..",
+    "target": "development",
+    "args": {
+      "BASE_IMAGE": "ubuntu:24.04",
+      "TZ": "${localEnv:TZ:Etc/UTC}"
+    }
+  },
+  "remoteUser": "zed",
+  "updateRemoteUserUID": true,
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace/zed,type=bind,consistency=cached",
+  "workspaceFolder": "/workspace/zed",
+  "mounts": [
+    "source=zed-build-cargo-registry-${devcontainerId},target=/home/zed/.cargo/registry,type=volume",
+    "source=zed-build-cargo-git-${devcontainerId},target=/home/zed/.cargo/git,type=volume"
+  ],
+  "containerEnv": {
+    "CARGO_TARGET_DIR": "/workspace/zed/target/container",
+    "RUST_BACKTRACE": "1"
+  },
+  "postCreateCommand": "rustc --version && cargo --version && svn --version --quiet",
+  "shutdownAction": "stopContainer"
+}

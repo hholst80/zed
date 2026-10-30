@@ -431,7 +431,10 @@ impl Editor {
         self.show_git_blame_gutter = !self.show_git_blame_gutter;
 
         if self.show_git_blame_gutter && !self.has_blame_entries(cx) {
+            self.clear_revision_blame(cx);
             self.start_git_blame(true, window, cx);
+        } else if self.show_git_blame_gutter {
+            self.clear_revision_blame(cx);
         }
 
         cx.notify();
@@ -2149,6 +2152,7 @@ impl Editor {
         {
             return;
         }
+        self.revision_blame = None;
         if let Some(project) = self.project() {
             if let Some(buffer) = self.buffer().read(cx).as_singleton()
                 && buffer.read(cx).file().is_none_or(|file| {

@@ -1,0 +1,28 @@
+[package]
+name = "zed_svn"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/svn.rs"
+crate-type = ["cdylib", "rlib"]
+doctest = false
+
+[dependencies]
+async-trait.workspace = true
+futures.workspace = true
+quick-xml = { workspace = true, features = ["serialize"] }
+semver.workspace = true
+serde.workspace = true
+source_control.workspace = true
+thiserror.workspace = true
+zed_extension_api = { path = "../../crates/extension_api" }
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

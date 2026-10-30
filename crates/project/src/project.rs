@@ -16,6 +16,7 @@ pub mod prettier_store;
 pub mod project_search;
 pub mod project_settings;
 pub mod search;
+pub mod source_control_store;
 pub mod task_inventory;
 pub mod task_store;
 pub mod telemetry_snapshot;
@@ -54,6 +55,7 @@ pub use git_store::{
 };
 pub use manifest_tree::ManifestTree;
 pub use project_search::{Search, SearchResults};
+use source_control_store::{SourceControlProviderRegistry, SourceControlStore};
 pub use worktree_store::WorktreePaths;
 
 use anyhow::{Context as _, Result, anyhow};
@@ -235,6 +237,7 @@ pub struct Project {
     // todo lw explain the client_state x remote_client matrix, its super confusing
     client_state: ProjectClientState,
     git_store: Entity<GitStore>,
+    source_control_store: Entity<SourceControlStore>,
     collaborators: HashMap<proto::PeerId, Collaborator>,
     client_subscriptions: Vec<client::Subscription>,
     worktree_store: Entity<WorktreeStore>,
@@ -1275,12 +1278,14 @@ impl Project {
         BufferStore::init(&client);
         LspStore::init(&client);
         GitStore::init(&client);
+        SourceControlStore::init(&client);
         SettingsObserver::init(&client);
         TaskStore::init(Some(&client));
         ToolchainStore::init(&client);
         DapStore::init(&client, cx);
         BreakpointStore::init(&client);
         context_server_store::init(cx);
+        SourceControlProviderRegistry::init(cx);
     }
 
     pub fn local(
@@ -1385,6 +1390,15 @@ impl Project {
                 )
             });
             git_store.update(cx, |git_store, _| git_store.set_project(weak_self.clone()));
+            let source_control_store = cx.new(|cx| {
+                SourceControlStore::local(
+                    git_store.clone(),
+                    worktree_store.clone(),
+                    environment.clone(),
+                    fs.clone(),
+                    cx,
+                )
+            });
 
             let task_store = cx.new(|cx| {
                 TaskStore::local(
@@ -1451,6 +1465,7 @@ impl Project {
                 join_project_response_message_id: 0,
                 client_state: ProjectClientState::Local,
                 git_store,
+                source_control_store,
                 client_subscriptions: Vec::new(),
                 _subscriptions: vec![cx.on_release(Self::release)],
                 active_entry: None,
@@ -1631,6 +1646,15 @@ impl Project {
                 )
             });
             git_store.update(cx, |git_store, _| git_store.set_project(weak_self.clone()));
+            let source_control_store = cx.new(|cx| {
+                SourceControlStore::remote(
+                    git_store.clone(),
+                    remote_proto.clone(),
+                    REMOTE_SERVER_PROJECT_ID,
+                    false,
+                    cx,
+                )
+            });
 
             let task_store = cx.new(|cx| {
                 TaskStore::remote(
@@ -1681,6 +1705,7 @@ impl Project {
                 join_project_response_message_id: 0,
                 client_state: ProjectClientState::Local,
                 git_store,
+                source_control_store,
                 agent_server_store,
                 client_subscriptions: Vec::new(),
                 _subscriptions: vec![
@@ -1905,6 +1930,15 @@ impl Project {
                 cx,
             )
         });
+        let source_control_store = cx.new(|cx| {
+            SourceControlStore::remote(
+                git_store.clone(),
+                client.clone().into(),
+                remote_id,
+                true,
+                cx,
+            )
+        });
 
         let task_store = cx.new(|cx| {
             if run_tasks {
@@ -2003,6 +2037,7 @@ impl Project {
                 breakpoint_store: breakpoint_store.clone(),
                 dap_store: dap_store.clone(),
                 git_store: git_store.clone(),
+                source_control_store,
                 agent_server_store,
                 buffers_needing_diff: Default::default(),
                 git_diff_debouncer: DebouncedDelay::new(),
@@ -2912,6 +2947,9 @@ impl Project {
             self.collab_client
                 .subscribe_to_entity(project_id)?
                 .set_entity(&self.git_store, &cx.to_async()),
+            self.collab_client
+                .subscribe_to_entity(project_id)?
+                .set_entity(&self.source_control_store, &cx.to_async()),
         ]);
 
         self.buffer_store.update(cx, |buffer_store, cx| {
@@ -6728,6 +6766,10 @@ impl Project {
 
     pub fn git_store(&self) -> &Entity<GitStore> {
         &self.git_store
+    }
+
+    pub fn source_control_store(&self) -> &Entity<SourceControlStore> {
+        &self.source_control_store
     }
 
     pub fn agent_server_store(&self) -> &Entity<AgentServerStore> {

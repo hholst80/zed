@@ -44,6 +44,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_json_lenient.workspace = true
 settings.workspace = true
+source_control.workspace = true
 task.workspace = true
 telemetry.workspace = true
 tempfile.workspace = true
@@ -55,6 +56,7 @@ wasmparser.workspace = true
 wasmtime-wasi.workspace = true
 wasmtime.workspace = true
 ztracing.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

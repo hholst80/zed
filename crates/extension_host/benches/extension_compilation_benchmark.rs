@@ -136,6 +136,7 @@ fn manifest() -> ExtensionManifest {
             .into_iter()
             .collect(),
         context_servers: BTreeMap::default(),
+        source_control_providers: BTreeMap::default(),
         slash_commands: BTreeMap::default(),
         snippets: None,
         capabilities: vec![ExtensionCapability::ProcessExec(
